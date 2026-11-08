@@ -32,6 +32,7 @@ ENGINE_FLAGS = -O3 -fno-math-errno -ffp-contract=fast -Isrc/fm
 ENGINE_SRC = src/fm/fm_engine.c src/fm/fm_presets.c src/fm/fm_carrier.c
 ENGINE_HDR = src/fm/fm_engine.h src/fm/fm_presets.h src/fm/fm_carrier.h
 FM_SRC = src/fm.c src/alsa_probe.c src/voice_hook.c src/discover.c src/crash.c src/fm/fm_engine.c src/fm/fm_carrier.c
+ARM_ASM = src/tramp_hooks.S src/tramp_aarch64.inc
 FM_HDR = src/probe.h src/version.h src/voice_hook.h src/discover.h src/crash.h $(ENGINE_HDR)
 # fm.so: the engine runs in it, so the engine flags; BTI/PAC landing pads
 # like the stock app (no-ops on the A55).
@@ -43,7 +44,7 @@ SHIM_FLAGS = -Isrc -Ilauncher
 ARM = build/aarch64
 HOST = build/host
 
-.PHONY: all toolchain arm check host dist bench wavs samples clean
+.PHONY: all toolchain arm check check-arm host dist bench wavs samples clean
 all: check arm
 
 toolchain: $(ZIG)
@@ -54,10 +55,18 @@ $(ZIG):
 arm: $(ARM)/fm.so $(ARM)/setarch $(ARM)/fmbench
 	sh tools/verify-arm.sh $(ARM)
 
-$(ARM)/fm.so: $(FM_SRC) $(FM_HDR) | $(ZIG)
+# aarch64 tests under qemu (tools/fetch-qemu.sh): the real trampolines.
+QEMU ?= $(CURDIR)/.tools/qemu/usr/bin/qemu-aarch64-static
+$(ARM)/test_tramp: tests/test_tramp.c tests/tramp_test.S src/tramp_aarch64.inc | $(ZIG)
+	@mkdir -p $(@D)
+	$(CC_ARM_STATIC) $(CFLAGS) -Isrc -o $@ tests/test_tramp.c tests/tramp_test.S
+check-arm: $(ARM)/test_tramp
+	$(QEMU) $(ARM)/test_tramp
+
+$(ARM)/fm.so: $(FM_SRC) $(FM_HDR) $(ARM_ASM) | $(ZIG)
 	@mkdir -p $(@D)
 	$(CC_ARM) $(CFLAGS) $(SO_FLAGS) $(FM_FLAGS) -mbranch-protection=standard -o $@ $(FM_SRC) \
-		-ldl -lpthread -lm
+		src/tramp_hooks.S -ldl -lpthread -lm
 
 $(ARM)/setarch: $(SHIM_SRC) $(SHIM_HDR) | $(ZIG)
 	@mkdir -p $(@D)
@@ -67,7 +76,7 @@ $(ARM)/fmbench: tools/fmbench.c $(ENGINE_SRC) $(ENGINE_HDR) | $(ZIG)
 	@mkdir -p $(@D)
 	$(CC_ARM_STATIC) $(CFLAGS) $(ENGINE_FLAGS) -o $@ tools/fmbench.c $(ENGINE_SRC) -lm
 
-dist: arm
+dist: arm check-arm
 	sh tools/mkdist.sh $(ARM) dist
 
 # ---- host build and tests ----

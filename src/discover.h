@@ -34,6 +34,9 @@ int disc_lookup(void *gen, fm_patch *p, int *root);
  * and writes a line into msg when something new was learned. */
 int disc_poll(uintptr_t image_lo, uintptr_t image_hi, int key_off, char *msg, size_t cap);
 
+/* A path known in advance (per app build): no search needed. */
+void disc_seed(const disc_path_t *d);
+
 /* For the status file. */
 int disc_paths(disc_path_t *out, int max);
 void disc_describe(const disc_path_t *d, char *out, size_t cap);
@@ -47,6 +50,12 @@ void disc_set_first_hop(disc_first_hop_fn fn);
 
 /* Safe memory read (process_vm_readv). 0 on success. */
 int disc_read(void *dst, uintptr_t addr, size_t n);
+
+/* Tests: polls between two searches (default 5; 0: no limit). */
+void disc_set_throttle(unsigned polls);
+
+/* Searches run so far (tests, status). */
+unsigned disc_searches(void);
 
 /* Tests: search from this object now (no queue). */
 int disc_search(void *gen, uintptr_t image_lo, uintptr_t image_hi, disc_path_t *found, int *reads);

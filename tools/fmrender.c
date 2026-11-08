@@ -24,7 +24,7 @@ static void put32(FILE *f, long v) { put16(f, (int)(v & 0xffff)); put16(f, (int)
 /* 16-bit mono WAV. carrier_root >= 0: embed the patch (FM carrier, see
  * fm_carrier.h) with that root note. Returns the peak level. */
 static float render_wav(const fm_patch *p, float hz, float vel, int hold, int total, const char *path,
-                        int carrier_root)
+                        int carrier_root, const fm_patch *embed)
 {
     float *x = calloc((size_t)total, sizeof *x);
     if (!x)
@@ -75,7 +75,7 @@ static float render_wav(const fm_patch *p, float hz, float vel, int hold, int to
         s = s > 1 ? 1 : s < -1 ? -1 : s;
         pcm[i] = (int16_t)lrintf(s * 32767.0f);
     }
-    if (carrier_root >= 0 && !fm_carrier_encode(p, carrier_root, pcm, total))
+    if (carrier_root >= 0 && !fm_carrier_encode(embed ? embed : p, carrier_root, pcm, total))
         fprintf(stderr, "%s: too short for an FM carrier header\n", path);
     for (int i = 0; i < total; i++)
         put16(f, pcm[i]);
@@ -109,7 +109,7 @@ int main(int argc, char **argv)
                     if (*c == ' ' || *c == '.')
                         *c = '_';
                 snprintf(path, sizeof path, "%s/%s-%d.wav", argv[2], name, note);
-                float pk = render_wav(&p, midi_hz(note), 0.8f, SR, 3 * SR, path, -1);
+                float pk = render_wav(&p, midi_hz(note), 0.8f, SR, 3 * SR, path, -1, NULL);
                 printf("%s  peak %.2f\n", path, pk);
             }
         }
@@ -127,9 +127,18 @@ int main(int argc, char **argv)
             fm_preset_get(fm_preset_find(S[i].preset), &p);
             char path[512];
             snprintf(path, sizeof path, "%s/%s.wav", argv[2], S[i].file);
-            float pk = render_wav(&p, midi_hz(60), 0.9f, (int)(S[i].hold * SR), (int)(S[i].total * SR), path, 60);
+            float pk = render_wav(&p, midi_hz(60), 0.9f, (int)(S[i].hold * SR), (int)(S[i].total * SR), path, 60, NULL);
             printf("%s  peak %.2f\n", path, pk);
         }
+        /* Live check: the recording is a plain sine, the hidden patch a
+         * bell. A bell on the MPC = live FM; a sine = the recording. */
+        fm_patch sine, bell;
+        fm_preset_get(fm_preset_find("Sine"), &sine);
+        fm_preset_get(fm_preset_find("Bell"), &bell);
+        char path[512];
+        snprintf(path, sizeof path, "%s/FM-LiveCheck-C3.wav", argv[2]);
+        float pk = render_wav(&sine, midi_hz(60), 0.9f, 3 * SR, (int)(3.5f * SR), path, 60, &bell);
+        printf("%s  peak %.2f (sine recording, bell patch)\n", path, pk);
         return 0;
     }
     if (argc != 7) {
@@ -143,7 +152,7 @@ int main(int argc, char **argv)
         return 2;
     }
     float pk = render_wav(&p, midi_hz(atoi(argv[2])), (float)atof(argv[3]), (int)(atof(argv[4]) * SR),
-                          (int)(atof(argv[5]) * SR), argv[6], -1);
+                          (int)(atof(argv[5]) * SR), argv[6], -1, NULL);
     printf("%s  peak %.2f\n", argv[6], pk);
     return pk < 0;
 }

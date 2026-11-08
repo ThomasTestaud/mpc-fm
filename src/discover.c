@@ -37,6 +37,13 @@ static _Atomic unsigned g_qhead, g_qtail;
  * (logger only): generators are reused for other samples. They expire
  * after RETRY_POLLS polls (a sample may not be loaded yet). */
 #define RETRY_POLLS 20
+static unsigned g_search_every = 5; /* at most one search per 5 polls (about 5 s) */
+static unsigned g_last_search;
+
+void disc_set_throttle(unsigned polls) { g_search_every = polls; }
+
+static unsigned g_searches;
+unsigned disc_searches(void) { return g_searches; }
 static struct {
     uintptr_t key;
     unsigned poll;
@@ -51,20 +58,23 @@ int disc_read(void *dst, uintptr_t addr, size_t n)
     return r == (ssize_t)n ? 0 : -1;
 }
 
-/* Header bytes at the end of a path. 1/0/-1 as fm_carrier_decode. */
+#define UNREADABLE (-2)
+
+/* Header at the end of a path: 1 carrier, 0 frames there but no header,
+ * -1 damaged header, UNREADABLE: the path does not lead to memory. */
 static int follow(void *gen, const disc_path_t *d, fm_patch *p, int *root)
 {
     uintptr_t q = (uintptr_t)gen;
     for (int i = 0; i < d->hops; i++) {
         uintptr_t next;
         if (disc_read(&next, q + (uintptr_t)d->off[i], sizeof next) != 0 || !next)
-            return 0;
+            return UNREADABLE;
         q = next;
     }
     unsigned char buf[FM_CARRIER_FRAMES * 4];
     int fb = fm_carrier_frame_bytes(d->fmt);
     if (disc_read(buf, q + (uintptr_t)d->data_off, 8 * (size_t)fb) != 0)
-        return 0;
+        return UNREADABLE;
     if (!fm_carrier_has_magic_fmt(buf, d->fmt, 8))
         return 0;
     if (disc_read(buf, q + (uintptr_t)d->data_off, (size_t)FM_CARRIER_FRAMES * (size_t)fb) != 0)
@@ -72,13 +82,34 @@ static int follow(void *gen, const disc_path_t *d, fm_patch *p, int *root)
     return fm_carrier_decode_fmt(buf, d->fmt, FM_CARRIER_FRAMES, p, root);
 }
 
+void disc_seed(const disc_path_t *d)
+{
+    int n = atomic_load_explicit(&g_npaths, memory_order_relaxed);
+    for (int i = 0; i < n; i++)
+        if (memcmp(&g_paths[i], d, sizeof *d) == 0)
+            return;
+    if (n < MAX_PATHS) {
+        g_paths[n] = *d;
+        atomic_store_explicit(&g_npaths, n + 1, memory_order_release);
+    }
+}
+
 int disc_lookup(void *gen, fm_patch *p, int *root)
 {
     int n = atomic_load_explicit(&g_npaths, memory_order_acquire);
-    for (int i = 0; i < n; i++)
-        if (follow(gen, &g_paths[i], p, root) == 1)
+    int readable = 0;
+    for (int i = 0; i < n; i++) {
+        int r = follow(gen, &g_paths[i], p, root);
+        if (r == 1)
             return 1;
-    /* Not found with what we know: let the logger look (if there is room). */
+        readable |= r != UNREADABLE;
+    }
+    /* A known path led to frames without a header: a normal sample, no
+     * search. (v0.1.2 searched for every normal sample: tens of thousands
+     * of reads that made the audio drop out.) */
+    if (readable)
+        return 0;
+    /* No path leads anywhere for this one: let the logger look. */
     unsigned h = atomic_load_explicit(&g_qhead, memory_order_relaxed);
     unsigned t = atomic_load_explicit(&g_qtail, memory_order_acquire);
     if (h - t < QUEUE) {
@@ -189,7 +220,9 @@ int disc_search(void *gen, uintptr_t image_lo, uintptr_t image_hi, disc_path_t *
                 continue;
             (*reads)++;
         }
-        size_t span = object_span(nd.addr);
+        /* The generator itself is not a heap block (it sits inside the
+         * voice): what precedes it means nothing, scan it in full. */
+        size_t span = nd.depth == 0 ? NODE_BYTES : object_span(nd.addr);
         for (int o = 0; o + 8 <= (int)span && n < MAX_NODES; o += 8) {
             uintptr_t v;
             memcpy(&v, buf + o, 8);
@@ -237,6 +270,8 @@ int disc_poll(uintptr_t image_lo, uintptr_t image_hi, int key_off, char *msg, si
             g_tried[i] = g_tried[--g_ntried];
         else
             i++;
+    if (g_last_search && g_polls - g_last_search < g_search_every)
+        return 0; /* the queue waits */
     while (t != h && !learned) {
         void *gen = g_queue[t % QUEUE];
         atomic_store_explicit(&g_qtail, ++t, memory_order_release);
@@ -250,7 +285,10 @@ int disc_poll(uintptr_t image_lo, uintptr_t image_hi, int key_off, char *msg, si
             continue;
         disc_path_t d;
         int reads = 0;
-        if (disc_search(gen, image_lo, image_hi, &d, &reads)) {
+        g_last_search = g_polls;
+        g_searches++;
+        int found = disc_search(gen, image_lo, image_hi, &d, &reads);
+        if (found) {
             int n = atomic_load_explicit(&g_npaths, memory_order_relaxed);
             if (n < MAX_PATHS) {
                 g_paths[n] = d;
@@ -265,6 +303,7 @@ int disc_poll(uintptr_t image_lo, uintptr_t image_hi, int key_off, char *msg, si
             g_tried[g_ntried].key = key; /* a normal sample, or out of reach */
             g_tried[g_ntried++].poll = g_polls;
         }
+        break; /* one search per turn */
     }
     return learned;
 }

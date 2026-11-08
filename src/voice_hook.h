@@ -27,12 +27,14 @@ typedef struct {
     _Atomic uint64_t fm_ns;         /* time in the FM engine */
     _Atomic uint64_t fm_max_ns;     /* longest FM render of one call */
     _Atomic uint64_t lookup_max_ns; /* longest carrier check at a note start */
-    _Atomic int active;             /* FM voices now */
     _Atomic uint32_t last_ratio_milli; /* last pitch ratio x 1000 */
     _Atomic int last_root;
 } vh_stats_t;
 
 extern vh_stats_t vh_stats;
+
+/* FM voices now. */
+int vh_active_voices(void);
 
 /* 1 while the thread runs our hook code, 2 while it runs the stock method
  * called from our hook, else 0 (for crash reports). */

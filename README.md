@@ -9,9 +9,12 @@ Plan: FM as a pad's sound source. A pad plays an FM patch instead of a
 sample, and everything after the sound source stays stock: filter, envelopes,
 Pad EQ, inserts, mixer, 16 Levels, Keys, export and resample.
 
-**Status: 0.1.1, FM pads prototype.** 0.1.0 ran on the device without a
-problem but never played FM: it hooked a voice class the drum pads do not use.
-0.1.1 hooks the right one (not yet tested on the device).
+**Status: 0.1.3, FM pads prototype (not yet tested on the device).**
+0.1.0 hooked a voice class the pads do not use. 0.1.1/0.1.2 played live FM
+but crashed: a C wrapper cannot pass on the 3 stack arguments of the stock
+note-start method. 0.1.3 hooks through assembly trampolines that pass on
+every register and the stack arguments (`src/tramp_aarch64.inc`, tested on
+aarch64 under qemu: `make check-arm`).
 
 - **FM carriers.** `make samples` writes WAV files that are recordings of FM
   patches with the patch hidden in the lowest 4 bits of the first 336 frames

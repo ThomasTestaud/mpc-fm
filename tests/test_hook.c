@@ -162,7 +162,7 @@ int main(void)
     /* 3. next note: live FM x the stock gain */
     new_gen(&g, 0.7f);
     vh_test_start(&g);
-    CHECK(vh_stats.fm_starts == 1 && vh_stats.active == 1, "next note: FM voice claimed (root %d)", vh_stats.last_root);
+    CHECK(vh_stats.fm_starts == 1 && vh_active_voices() == 1, "next note: FM voice claimed (root %d)", vh_stats.last_root);
     play(&g, out, 600);
     fm_patch ep; fm_preset_get(fm_preset_find("E.Piano"), &ep);
     fm_voice v; fm_voice_init(&v, 44100.0f); fm_voice_note_on(&v, 1.0f);
@@ -202,16 +202,16 @@ int main(void)
     setu64(&g, 328, PLAIN + 0x100);
     play(&g, out, 2);
     d = 0; for (int i = 0; i < 2 * N; i++) d = fmax(d, fabs(out[i] - frames_f[i]));
-    CHECK(d == 0.0 && vh_stats.unsupported == 1 && vh_stats.active == 0, "stereo/stretch layer: stock recording");
+    CHECK(d == 0.0 && vh_stats.unsupported == 1 && vh_active_voices() == 0, "stereo/stretch layer: stock recording");
 
     /* 7. end of sample and stop free the FM voice */
     new_gen(&g, 1.0f);
     vh_test_start(&g);
     play(&g, out, 800); /* past the end */
-    CHECK(vh_stats.active == 0, "FM voice freed when the stock layer ends");
+    CHECK(vh_active_voices() == 0, "FM voice freed when the stock layer ends");
     vh_test_start(&g);
     vh_test_stop(&g);
-    CHECK(vh_stats.active == 0, "FM voice freed at stop");
+    CHECK(vh_active_voices() == 0, "FM voice freed at stop");
 
     /* 8. discovery also finds int16 frames */
     disc_path_t q; int reads = 0;
@@ -222,6 +222,66 @@ int main(void)
     char desc[160]; disc_describe(&q, desc, sizeof desc);
     CHECK(ok && q.fmt == FM_FMT_I16, "int16 frames found too: %s (%d reads)", desc, reads);
     (void)old_holder;
+
+    /* 10. a decoy: gen+48 leads (through shared objects) to a carrier; the
+     * pad's own sample (+240) is a normal sample. Must not be learned. */
+    {
+        disc_path_t q2;
+        int r2 = 0;
+        make_frames(1, "Bell", 60);
+        void *dsample = calloc(1, 0x400), *dprov = calloc(1, 0x100), *dhold = calloc(1, 0x40);
+        void *dframes = frames_f;
+        memcpy((char *)dsample + 368, &dprov, 8);
+        memcpy((char *)dprov + 40, &dhold, 8);
+        memcpy(dhold, &dframes, 8);
+        static float plain[FRAMES];
+        void *nsample = calloc(1, 0x400), *nprov = calloc(1, 0x100), *nhold = calloc(1, 0x40);
+        void *nframes = plain;
+        memcpy((char *)nsample + 368, &nprov, 8);
+        memcpy((char *)nprov + 40, &nhold, 8);
+        memcpy(nhold, &nframes, 8);
+        gen_t g3; new_gen(&g3, 1.0f);
+        memcpy(g3.b + 48, &dsample, 8);  /* the decoy branch */
+        memcpy(g3.b + 240, &nsample, 8); /* the pad's own sample: not a carrier */
+        CHECK(!disc_search(&g3, 0, 0, &q2, &r2), "decoy through gen+48 is not followed (%d reads)", r2);
+        memcpy(g3.b + 240, &dsample, 8);
+        int ok3 = disc_search(&g3, 0, 0, &q2, &r2);
+        CHECK(ok3 && q2.off[0] == 240, "the same carrier through gen+240 is found");
+    }
+
+    /* 11. FM voice: the stock position advances 1 frame per frame at any pitch */
+    vh_test_setup(fake_start, fake_stop, fake_render, PLAIN);
+    make_frames(1, "Sine", 60);
+    build_chain(frames_f);
+    {
+        disc_path_t seed = {4, {240, 368, 40, 0}, 0, FM_FMT_F32};
+        disc_seed(&seed);
+    }
+    new_gen(&g, 1.0f);
+    g_ratio = 3.0;
+    vh_test_start(&g);
+    CHECK(vh_active_voices() == 1, "seeded path: FM from the first note, no search");
+    play(&g, out, 10);
+    CHECK(getu64(&g, 368) == ((uint64_t)(10 * N) << 32), "ratio 3: position advanced %llu frames for %d (1 per frame)",
+          (unsigned long long)(getu64(&g, 368) >> 32), 10 * N);
+    CHECK(vh_stats.last_ratio_milli == 3000, "pitch still read as ratio %.3f", vh_stats.last_ratio_milli / 1000.0);
+    g_ratio = 1.0;
+
+    /* 12. a non-finite stock gain: stock output kept, FM voice dropped */
+    new_gen(&g, 1.0f);
+    vh_test_start(&g);
+    setf(&g, 88, NAN);
+    play(&g, out, 1);
+    CHECK(vh_stats.bad_input == 1 && vh_active_voices() == 0, "NaN stock gain: back to stock, counted");
+
+    /* 13. with a working path, a normal sample does not start a search */
+    unsigned searches0 = disc_searches();
+    make_frames(0, NULL, 60);
+    build_chain(frames_f);
+    new_gen(&g, 1.0f);
+    vh_test_start(&g);
+    vh_poll(msg, sizeof msg);
+    CHECK(vh_active_voices() == 0 && disc_searches() == searches0, "normal sample on a known path: no search");
 
     /* 9. vh_install: checks the 16 stock entries, swaps 0, 3 and 7 */
     const uintptr_t VT = 0x6da6430, TI = 0x6e84c30;

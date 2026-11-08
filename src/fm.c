@@ -448,7 +448,7 @@ static void status_fm(sbuf *b)
               " FM file on a stereo/stretch layer %llu, dropped: bad stock gain %llu,"
               " bad FM output %llu\n",
               (unsigned long long)atomic_load(&vh_stats.starts),
-              (unsigned long long)atomic_load(&vh_stats.fm_starts), atomic_load(&vh_stats.active),
+              (unsigned long long)atomic_load(&vh_stats.fm_starts), vh_active_voices(),
               (unsigned long long)atomic_load(&vh_stats.no_slot),
               (unsigned long long)atomic_load(&vh_stats.unsupported),
               (unsigned long long)atomic_load(&vh_stats.bad_input),

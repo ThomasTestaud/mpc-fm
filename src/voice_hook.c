@@ -43,6 +43,7 @@
 #include <unistd.h>
 
 #include "discover.h"
+#include "fm/fm_carrier.h"
 #include "fm/fm_engine.h"
 
 #define OFF_RENDER_FN 328
@@ -69,13 +70,17 @@ typedef struct {
     const char *build_id;
     uintptr_t vtable, typeinfo, method[VT_ENTRIES], plain_mono;
     uintptr_t image_size;
+    disc_path_t frames_path; /* where a sample's first frames are, from the generator */
 } layout_t;
 
 static const layout_t LAYOUTS[] = {
     {"1dac7f481a0fe8d128e435ace88d7e6aece0c9c9", 0x6da6430, 0x6e84c30,
      {0x220d720, 0x21fdee0, 0x20c1430, 0x220ef30, 0x220d960, 0x220d660, 0x220d690, 0x220f490,
       0x220db70, 0x220db30, 0x20bfa80, 0x220d880, 0x220dee0, 0x220d730, 0x220d7a0, 0x220dd30},
-     0x2216f70, 0x7300000},
+     0x2216f70, 0x7300000,
+     /* learned the same way in two device runs (v0.1.1, v0.1.2): the
+      * generator's reader points at frame 0 at note start */
+     {2, {528, 0}, 0, FM_FMT_F32}},
 };
 
 typedef struct {
@@ -87,11 +92,17 @@ typedef struct {
 } slot_t;
 
 static slot_t g_slots[SLOTS];
-static vh_fn g_start, g_stop, g_render;
 static uintptr_t g_plain_mono, g_image_lo, g_image_hi;
 vh_stats_t vh_stats;
 
-static inline float f32(void *o, int off) { float v; memcpy(&v, (char *)o + off, 4); return v; }
+/* Read by the trampolines (tramp_hooks.S): the stock methods, and the gates
+ * (render/stop skip our code entirely while no FM voice exists). */
+void *vh_orig_start, *vh_orig_stop, *vh_orig_render;
+int vh_active;
+int vh_gate_always = 1;
+
+int vh_active_voices(void) { return __atomic_load_n(&vh_active, __ATOMIC_RELAXED); }
+
 static inline uint64_t u64(void *o, int off) { uint64_t v; memcpy(&v, (char *)o + off, 8); return v; }
 static inline void set_u64(void *o, int off, uint64_t v) { memcpy((char *)o + off, &v, 8); }
 
@@ -119,7 +130,7 @@ static inline uint64_t now_ns(void)
 
 static slot_t *slot_find(void *gen)
 {
-    if (atomic_load_explicit(&vh_stats.active, memory_order_relaxed) <= 0)
+    if (__atomic_load_n(&vh_active, __ATOMIC_RELAXED) <= 0)
         return NULL;
     for (int i = 0; i < SLOTS; i++)
         if (atomic_load_explicit(&g_slots[i].owner, memory_order_acquire) == gen)
@@ -132,7 +143,7 @@ static void slot_release(void *gen)
     slot_t *s = slot_find(gen);
     if (s) {
         atomic_store_explicit(&s->owner, NULL, memory_order_release);
-        atomic_fetch_sub_explicit(&vh_stats.active, 1, memory_order_relaxed);
+        __atomic_fetch_sub(&vh_active, 1, __ATOMIC_RELAXED);
     }
 }
 
@@ -156,7 +167,7 @@ static void claim(void *gen)
             s->ratio = 1.0;
             fm_voice_init(&s->voice, SR);
             fm_voice_note_on(&s->voice, 1.0f); /* velocity: the stock gain carries it */
-            atomic_fetch_add_explicit(&vh_stats.active, 1, memory_order_relaxed);
+            __atomic_fetch_add(&vh_active, 1, __ATOMIC_RELAXED);
             atomic_fetch_add_explicit(&vh_stats.fm_starts, 1, memory_order_relaxed);
             atomic_store_explicit(&vh_stats.last_root, root, memory_order_relaxed);
             return;
@@ -165,28 +176,52 @@ static void claim(void *gen)
     atomic_fetch_add_explicit(&vh_stats.no_slot, 1, memory_order_relaxed);
 }
 
-static uintptr_t w_start(void *gen, uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4,
-                         uintptr_t a5, uintptr_t a6, uintptr_t a7)
+/* ---- hooks: pre/post pairs, run by the trampolines around the stock
+ * method (tramp_aarch64.inc). The stock method always gets exactly its own
+ * arguments, stack arguments included. ---- */
+
+typedef struct {
+    uint64_t x[9]; /* x0..x8 as the caller passed them */
+    uint64_t pad;
+    unsigned char q[8][16];
+} vh_regs;
+typedef struct {
+    uint64_t w[8];
+} vh_ctx;
+
+void vh_pre_start(vh_regs *r, vh_ctx *c)
 {
+    (void)r;
+    (void)c;
     vh_in_hook = 2;
-    uintptr_t r = g_start(gen, a1, a2, a3, a4, a5, a6, a7); /* stock first: its args untouched */
+}
+
+void vh_post_start(vh_regs *r, uint64_t ret, vh_ctx *c)
+{
+    (void)ret;
+    (void)c;
+    void *gen = (void *)r->x[0];
     vh_in_hook = 1;
     atomic_fetch_add_explicit(&vh_stats.starts, 1, memory_order_relaxed);
     slot_release(gen); /* a reused generator: forget its old note */
     claim(gen);
     vh_in_hook = 0;
-    return r;
 }
 
-static uintptr_t w_stop(void *gen, uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4,
-                        uintptr_t a5, uintptr_t a6, uintptr_t a7)
+void vh_pre_stop(vh_regs *r, vh_ctx *c)
 {
+    (void)r;
+    (void)c;
     vh_in_hook = 2;
-    uintptr_t r = g_stop(gen, a1, a2, a3, a4, a5, a6, a7);
+}
+
+void vh_post_stop(vh_regs *r, uint64_t ret, vh_ctx *c)
+{
+    (void)ret;
+    (void)c;
     vh_in_hook = 1;
-    slot_release(gen);
+    slot_release((void *)r->x[0]);
     vh_in_hook = 0;
-    return r;
 }
 
 static void drop(void *gen, _Atomic uint64_t *counter)
@@ -195,30 +230,48 @@ static void drop(void *gen, _Atomic uint64_t *counter)
     slot_release(gen);
 }
 
-static uintptr_t w_render(void *gen, uintptr_t a_buf, uintptr_t a_n, uintptr_t a3, uintptr_t a4,
-                          uintptr_t a5, uintptr_t a6, uintptr_t a7)
+/* ctx: w[0] slot (0: not ours), w[1] delay, w[2] gain, w[3] target,
+ * w[4] step, w[5] position before */
+void vh_pre_render(vh_regs *r, vh_ctx *c)
 {
+    void *gen = (void *)r->x[0];
+    c->w[0] = 0;
+    vh_in_hook = 1;
     slot_t *s = slot_find(gen);
-    if (!s)
-        return g_render(gen, a_buf, a_n, a3, a4, a5, a6, a7);
-    vh_in_hook = 1;
-    if (u64(gen, OFF_RENDER_FN) != g_plain_mono) { /* stereo or time-stretch: stock */
+    if (s && u64(gen, OFF_RENDER_FN) != g_plain_mono) { /* stereo or time-stretch: stock */
         drop(gen, &vh_stats.unsupported);
-        vh_in_hook = 2;
-        uintptr_t r = g_render(gen, a_buf, a_n, a3, a4, a5, a6, a7);
-        vh_in_hook = 0;
-        return r;
+        s = NULL;
     }
-    float *buf = (float *)a_buf;
-    int n = (int)a_n;
-    int delay;
-    memcpy(&delay, (char *)gen + OFF_DELAY, 4);
-    float g = f32(gen, OFF_GAIN), target = f32(gen, OFF_GAIN + 4), step = f32(gen, OFF_GAIN + 8);
-    uint64_t pos0 = u64(gen, OFF_POS);
-
+    if (s) {
+        int delay;
+        memcpy(&delay, (char *)gen + OFF_DELAY, 4);
+        c->w[0] = (uint64_t)(uintptr_t)s;
+        c->w[1] = (uint64_t)(int64_t)delay;
+        memcpy(&c->w[2], (char *)gen + OFF_GAIN, 4);
+        memcpy(&c->w[3], (char *)gen + OFF_GAIN + 4, 4);
+        memcpy(&c->w[4], (char *)gen + OFF_GAIN + 8, 4);
+        c->w[5] = u64(gen, OFF_POS);
+    }
     vh_in_hook = 2;
-    uintptr_t r = g_render(gen, a_buf, a_n, a3, a4, a5, a6, a7);
+}
+
+void vh_post_render(vh_regs *r, uint64_t ret, vh_ctx *c)
+{
+    slot_t *s = (slot_t *)(uintptr_t)c->w[0];
+    if (!s) {
+        vh_in_hook = 0;
+        return;
+    }
     vh_in_hook = 1;
+    void *gen = (void *)r->x[0];
+    float *buf = (float *)r->x[1];
+    int n = (int)r->x[2];
+    int delay = (int)(int64_t)c->w[1];
+    float g, target, step;
+    memcpy(&g, &c->w[2], 4);
+    memcpy(&target, &c->w[3], 4);
+    memcpy(&step, &c->w[4], 4);
+    uint64_t pos0 = c->w[5];
 
     int d = delay < 0 ? 0 : delay > n ? n : delay; /* the stock wrote zeros there */
     int m = n - d;
@@ -227,7 +280,7 @@ static uintptr_t w_render(void *gen, uintptr_t a_buf, uintptr_t a_n, uintptr_t a
     if (!sane) {
         drop(gen, &vh_stats.bad_input); /* keep the stock output */
         vh_in_hook = 0;
-        return r;
+        return;
     }
     if (m > 0 && buf) {
         uint64_t t0 = now_ns();
@@ -267,10 +320,10 @@ static uintptr_t w_render(void *gen, uintptr_t a_buf, uintptr_t a_n, uintptr_t a
             memset(buf + d, 0, (size_t)m * sizeof(float));
             drop(gen, &vh_stats.bad_output);
             vh_in_hook = 0;
-            return r;
+            return;
         }
         /* One frame per frame from now on, whatever the pitch. */
-        if (r & 0xff)
+        if (ret & 0xff)
             set_u64(gen, OFF_POS, pos0 + ((uint64_t)m << 32));
         uint64_t dt = now_ns() - t0;
         atomic_fetch_add_explicit(&vh_stats.fm_ns, dt, memory_order_relaxed);
@@ -280,11 +333,56 @@ static uintptr_t w_render(void *gen, uintptr_t a_buf, uintptr_t a_n, uintptr_t a
         atomic_store_explicit(&vh_stats.last_ratio_milli, (uint32_t)(s->ratio * 1000.0),
                               memory_order_relaxed);
     }
-    if (!(r & 0xff))
+    if (!(ret & 0xff))
         slot_release(gen); /* the stock layer has ended */
     vh_in_hook = 0;
-    return r;
 }
+
+/* The functions that go into the vtable. On the device: the assembly
+ * trampolines. On the computer (tests): the same pre/post around a plain
+ * call, enough for fakes that take only register arguments. */
+#if defined(__aarch64__) && !defined(MPCFM_TEST)
+extern char vh_tramp_render[], vh_tramp_start[], vh_tramp_stop[];
+#define TRAMP_RENDER ((uintptr_t)vh_tramp_render)
+#define TRAMP_START ((uintptr_t)vh_tramp_start)
+#define TRAMP_STOP ((uintptr_t)vh_tramp_stop)
+#else
+static uintptr_t emulate(void *orig, int gated, void (*pre)(vh_regs *, vh_ctx *),
+                         void (*post)(vh_regs *, uint64_t, vh_ctx *), uintptr_t a0, uintptr_t a1,
+                         uintptr_t a2, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6,
+                         uintptr_t a7)
+{
+    if (gated && !__atomic_load_n(&vh_active, __ATOMIC_RELAXED))
+        return ((vh_fn)orig)((void *)a0, a1, a2, a3, a4, a5, a6, a7);
+    vh_regs r = {{a0, a1, a2, a3, a4, a5, a6, a7, 0}, 0, {{0}}};
+    vh_ctx c = {{0}};
+    pre(&r, &c);
+    uintptr_t ret = ((vh_fn)orig)((void *)a0, a1, a2, a3, a4, a5, a6, a7);
+    post(&r, ret, &c);
+    return ret;
+}
+static uintptr_t e_render(void *g, uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4,
+                          uintptr_t a5, uintptr_t a6, uintptr_t a7)
+{
+    return emulate(vh_orig_render, 1, vh_pre_render, vh_post_render, (uintptr_t)g, a1, a2, a3,
+                   a4, a5, a6, a7);
+}
+static uintptr_t e_start(void *g, uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4,
+                         uintptr_t a5, uintptr_t a6, uintptr_t a7)
+{
+    return emulate(vh_orig_start, 0, vh_pre_start, vh_post_start, (uintptr_t)g, a1, a2, a3, a4,
+                   a5, a6, a7);
+}
+static uintptr_t e_stop(void *g, uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4,
+                        uintptr_t a5, uintptr_t a6, uintptr_t a7)
+{
+    return emulate(vh_orig_stop, 1, vh_pre_stop, vh_post_stop, (uintptr_t)g, a1, a2, a3, a4, a5,
+                   a6, a7);
+}
+#define TRAMP_RENDER ((uintptr_t)e_render)
+#define TRAMP_START ((uintptr_t)e_start)
+#define TRAMP_STOP ((uintptr_t)e_stop)
+#endif
 
 int vh_install(uintptr_t base, const char *build_id, char *msg, size_t cap)
 {
@@ -315,18 +413,20 @@ int vh_install(uintptr_t base, const char *build_id, char *msg, size_t cap)
         snprintf(msg, cap, "mprotect failed");
         return 0;
     }
-    g_render = (vh_fn)vt[SLOT_RENDER];
-    g_stop = (vh_fn)vt[SLOT_STOP];
-    g_start = (vh_fn)vt[SLOT_START];
+    vh_orig_render = (void *)vt[SLOT_RENDER];
+    vh_orig_stop = (void *)vt[SLOT_STOP];
+    vh_orig_start = (void *)vt[SLOT_START];
     g_plain_mono = base + L->plain_mono;
     g_image_lo = base;
     g_image_hi = base + L->image_size;
     disc_set_first_hop(first_hop);
-    __atomic_store_n(&vt[SLOT_RENDER], (uintptr_t)w_render, __ATOMIC_RELEASE);
-    __atomic_store_n(&vt[SLOT_STOP], (uintptr_t)w_stop, __ATOMIC_RELEASE);
-    __atomic_store_n(&vt[SLOT_START], (uintptr_t)w_start, __ATOMIC_RELEASE);
+    disc_seed(&L->frames_path);
+    __atomic_store_n(&vt[SLOT_RENDER], TRAMP_RENDER, __ATOMIC_RELEASE);
+    __atomic_store_n(&vt[SLOT_STOP], TRAMP_STOP, __ATOMIC_RELEASE);
+    __atomic_store_n(&vt[SLOT_START], TRAMP_START, __ATOMIC_RELEASE);
     mprotect((void *)lo, hi - lo, PROT_READ);
-    snprintf(msg, cap, "DefaultSampleGenerator hooks on (vtable %#lx)", (unsigned long)L->vtable);
+    snprintf(msg, cap, "DefaultSampleGenerator hooks on (vtable %#lx, trampolines)",
+             (unsigned long)L->vtable);
     return 1;
 }
 
@@ -338,19 +438,21 @@ int vh_poll(char *msg, size_t cap)
 #ifdef MPCFM_TEST
 void vh_test_setup(vh_fn start, vh_fn stop, vh_fn render, uintptr_t plain_mono)
 {
-    g_start = start;
-    g_stop = stop;
-    g_render = render;
+    vh_orig_start = (void *)start;
+    vh_orig_stop = (void *)stop;
+    vh_orig_render = (void *)render;
     g_plain_mono = plain_mono;
     g_image_lo = g_image_hi = 0;
     disc_set_first_hop(first_hop);
+    disc_set_throttle(0);
     memset(g_slots, 0, sizeof g_slots);
     memset(&vh_stats, 0, sizeof vh_stats);
+    vh_active = 0;
 }
-uintptr_t vh_test_start(void *gen) { return w_start(gen, 0, 0, 0, 0, 0, 0, 0); }
-uintptr_t vh_test_stop(void *gen) { return w_stop(gen, 0, 0, 0, 0, 0, 0, 0); }
+uintptr_t vh_test_start(void *gen) { return e_start(gen, 0, 0, 0, 0, 0, 0, 0); }
+uintptr_t vh_test_stop(void *gen) { return e_stop(gen, 0, 0, 0, 0, 0, 0, 0); }
 uintptr_t vh_test_render(void *gen, float *buf, int n)
 {
-    return w_render(gen, (uintptr_t)buf, (uintptr_t)n, 0, 0, 0, 0, 0);
+    return e_render(gen, (uintptr_t)buf, (uintptr_t)n, 0, 0, 0, 0, 0);
 }
 #endif
