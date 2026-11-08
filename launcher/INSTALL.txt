@@ -5,8 +5,10 @@ mpc-fm is a separate project. It does not contain SampQOL OS and does not
 change any SampQOL file. Get SampQOL OS only from its official page:
 https://github.com/snarebes/SampQOL-OS/releases
 
-This version (phase 0) makes no sound. It only measures the audio timing
-and CPU use of the MPC, to plan the FM engine.
+Version 0.1.0: FM pads (first prototype). The files in MPC-FM-Samples are
+"FM carriers": each one is a recording of an FM sound with the FM patch
+hidden inside it. Load one on a pad: with mpc-fm, the pad plays the live FM
+engine; without mpc-fm (or on another MPC) it plays the recording.
 
 Install
 -------
@@ -29,13 +31,23 @@ Install
    No SampQOL splash at all: SampQOL was not found, the MPC starts stock.
    See logs/mpcfm-launch.log.
 
-FM sounds on pads today
------------------------
-The live FM engine is not in the app yet. The folder MPC-FM-Samples has
-FM sounds made by the same engine, as WAV one-shots at C3. Copy it to the
-card, load a file on a pad in SAMPLE SELECT, and play it chromatically in
-Keys mode. (They are recordings: pitch changes their length, as for any
-sample.)
+FM pads
+-------
+1. Copy the folder MPC-FM-Samples to the card.
+2. In SAMPLE SELECT, load for example FM-EPiano-C3.wav on a pad.
+3. Play it. Keys mode plays it chromatically (root C3). Tune, filter,
+   envelopes, Pad EQ, inserts, mixer and export work as for any pad.
+To check that it is live FM, not the recording: logs/mpcfm-status.txt,
+section "FM voices": "FM notes" counts the notes played by the engine.
+
+Limits of this prototype:
+- The FM envelopes do not get the note-off yet: the pad's amp envelope
+  (Attack/Decay, One Shot or Note On) shapes the end of the note.
+- Velocity changes the volume (stock), not yet the FM brightness.
+- A note lasts at most as long as the file (E.Piano 4 s, Bell 6 s...), as
+  for a sample in One Shot mode.
+- Do not edit the file in the MPC (trim, normalize, chop): it then plays as
+  a normal recording.
 
 Results
 -------

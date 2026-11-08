@@ -9,17 +9,27 @@ Plan: FM as a pad's sound source. A pad plays an FM patch instead of a
 sample, and everything after the sound source stays stock: filter, envelopes,
 Pad EQ, inserts, mixer, 16 Levels, Keys, export and resample.
 
-**Status: phase 0.** `fm.so` makes no sound yet. It measures the real audio
-budget on the device (block timing, xruns, CPU use and priority of each
-thread, CPU clocks) so the FM engine can be sized from real numbers.
-At start-up a line under the SampQOL splash shows `mpc-fm 0.0.1  FM on`, or
-why FM is off.
+**Status: 0.1.0, first FM pads prototype (not yet tested on the device).**
 
-The FM engine (`src/fm/`) is written and tested on the computer, not yet
-wired into the app: 4 operators, 8 algorithms, an envelope per operator,
-feedback on operator 4. No allocation, no locks; the output does not depend
-on how a note is cut into render calls (bit-exact, tested). `fmbench` measures
-it on the MPC's CPU, `fmrender` writes presets to WAV.
+- **FM carriers.** `make samples` writes WAV files that are recordings of FM
+  patches with the patch hidden in the lowest 4 bits of the first 336 frames
+  (at most 15 LSB, -66 dB, CRC-checked; `src/fm/fm_carrier.c`). On a stock
+  MPC they play as recordings. With mpc-fm, a pad with such a file plays the
+  live FM engine; the patch travels with the sample into projects.
+- **Voice hook** (`src/voice_hook.c`). Three vtable entries of the stock
+  sample voice (`Qbq::SamplerVoiceMemoryMode`: start, stop, process) are
+  swapped, after a check that the vtable is exactly stock for app build
+  `1dac7f48` (fw 1.3.0.12). For a carrier, the stock reader runs with its
+  gains at 0 (so position, loops, end of sample and fades stay stock) and
+  the FM output is added with the stock gains and fade, at the stock pitch
+  increment. Everything after the sound source is stock: filter, envelopes,
+  Pad EQ, inserts, mixer, 16 Levels, Keys, export.
+- **FM engine** (`src/fm/`): 4 operators, 8 algorithms, an envelope per
+  operator, feedback on operator 4. No allocation, no locks; output
+  bit-exact whatever the render block sizes.
+- **Probe**: audio block timing (window and since start), xruns, thread CPU
+  and priorities, CPU clocks, FM voice counters and cost.
+- A line under the SampQOL splash shows `mpc-fm 0.1.0  FM on`, or why not.
 
 ## How it loads
 
@@ -69,7 +79,8 @@ CPU tuning: `-mcpu=cortex_a55` (Rockchip RK3566).
 |---|---|
 | `src/fm.c` | entry point, status/log thread |
 | `src/alsa_probe.c` | timing wrappers of the ALSA PCM calls |
-| `src/fm/` | FM engine and presets |
+| `src/fm/` | FM engine, presets, carrier header |
+| `src/voice_hook.c` | FM as the sound source of a pad (stock voice hooks) |
 | `launcher/` | `autorun.sh` template, `autorun.json`, `setarch` stand-in, status strip |
 | `tools/` | toolchain fetch, `autorun.check`, SD folder, aarch64 checks, `fmbench`, `fmrender`, font generator |
 | `tests/` | engine unit tests; launcher tests with a fake ALSA library, fake app and fake framebuffer |

@@ -102,31 +102,58 @@ static probe_slot *slot_get(void *pcm, int stream)
     return s ? s : slot_claim(pcm, stream);
 }
 
-/* Publish the finished window (seqlock writer side) and start a new one. */
+static void merge(fn_window *a, const fn_window *b)
+{
+    a->calls += b->calls;
+    a->frames += b->frames;
+    if (b->last_frames)
+        a->last_frames = b->last_frames;
+    a->in_sum_ns += b->in_sum_ns;
+    a->gap_n += b->gap_n;
+    a->gap_sum_ns += b->gap_sum_ns;
+    if (b->in_max_ns > a->in_max_ns)
+        a->in_max_ns = b->in_max_ns;
+    if (b->gap_max_ns > a->gap_max_ns)
+        a->gap_max_ns = b->gap_max_ns;
+    if (b->cycle_max_ns > a->cycle_max_ns)
+        a->cycle_max_ns = b->cycle_max_ns;
+    for (int h = 0; h < PROBE_HIST; h++)
+        a->gap_hist[h] += b->gap_hist[h];
+}
+
+/* Publish the finished window (seqlock writer side) and start a new one.
+ * Once per window, so its cost does not matter. */
 static void publish(probe_slot *s, uint64_t epoch)
 {
+    for (int f = 0; f < FN_COUNT; f++) {
+        if (s->cur[f].gap_max_ns > s->sess[f].gap_max_ns)
+            s->sess_worst_epoch[f] = s->epoch;
+        merge(&s->sess[f], &s->cur[f]);
+    }
     uint32_t q = atomic_load_explicit(&s->seq, memory_order_relaxed);
     atomic_store_explicit(&s->seq, q + 1, memory_order_relaxed);
     atomic_thread_fence(memory_order_release);
     memcpy(s->done, s->cur, sizeof s->done);
+    memcpy(s->done_sess, s->sess, sizeof s->done_sess);
+    memcpy(s->done_worst_epoch, s->sess_worst_epoch, sizeof s->done_worst_epoch);
     s->done_epoch = s->epoch;
     atomic_store_explicit(&s->seq, q + 2, memory_order_release);
     memset(s->cur, 0, sizeof s->cur);
     s->epoch = epoch;
 }
 
-int probe_snapshot(probe_slot *s, fn_window out[FN_COUNT], uint64_t *epoch)
+int probe_snapshot(probe_slot *s, probe_view *out)
 {
     for (int tries = 0; tries < 20; tries++) {
         uint32_t q1 = atomic_load_explicit(&s->seq, memory_order_acquire);
         if (!(q1 & 1)) {
-            memcpy(out, s->done, sizeof s->done);
-            uint64_t e = s->done_epoch;
+            memcpy(out->win, s->done, sizeof s->done);
+            memcpy(out->sess, s->done_sess, sizeof s->done_sess);
+            memcpy(out->worst_epoch, s->done_worst_epoch, sizeof s->done_worst_epoch);
+            out->epoch = s->done_epoch;
             atomic_thread_fence(memory_order_acquire);
-            if (atomic_load_explicit(&s->seq, memory_order_relaxed) == q1) {
-                *epoch = e;
+            if (atomic_load_explicit(&s->seq, memory_order_relaxed) == q1)
                 return 1;
-            }
         }
         struct timespec t = {0, 50000};
         nanosleep(&t, NULL);

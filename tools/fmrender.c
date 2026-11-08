@@ -2,7 +2,8 @@
  *
  *   fmrender PRESET MIDI_NOTE VELOCITY HOLD_S TOTAL_S OUT.wav
  *   fmrender all DIR          (each preset: C2, C3 and C4, into DIR)
- *   fmrender samples DIR      (each preset once, at C3, for MPC pads)
+ *   fmrender samples DIR      (each preset once, at C3, for MPC pads: FM carriers,
+ *                              they play live with mpc-fm, as recordings without)
  *   fmrender list
  */
 #include <math.h>
@@ -11,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "fm_carrier.h"
 #include "fm_engine.h"
 #include "fm_presets.h"
 
@@ -19,8 +21,10 @@
 static void put16(FILE *f, int v) { fputc(v & 255, f); fputc((v >> 8) & 255, f); }
 static void put32(FILE *f, long v) { put16(f, (int)(v & 0xffff)); put16(f, (int)((v >> 16) & 0xffff)); }
 
-/* 16-bit mono WAV. Returns the peak level. */
-static float render_wav(const fm_patch *p, float hz, float vel, int hold, int total, const char *path)
+/* 16-bit mono WAV. carrier_root >= 0: embed the patch (FM carrier, see
+ * fm_carrier.h) with that root note. Returns the peak level. */
+static float render_wav(const fm_patch *p, float hz, float vel, int hold, int total, const char *path,
+                        int carrier_root)
 {
     float *x = calloc((size_t)total, sizeof *x);
     if (!x)
@@ -60,12 +64,23 @@ static float render_wav(const fm_patch *p, float hz, float vel, int hold, int to
     put16(f, 16);
     fwrite("data", 1, 4, f);
     put32(f, total * 2);
+    int16_t *pcm = malloc((size_t)total * sizeof *pcm);
+    if (!pcm) {
+        fclose(f);
+        free(x);
+        return -1;
+    }
     for (int i = 0; i < total; i++) {
         float s = x[i] * 0.8f; /* -2 dB headroom */
         s = s > 1 ? 1 : s < -1 ? -1 : s;
-        put16(f, (int)lrintf(s * 32767.0f));
+        pcm[i] = (int16_t)lrintf(s * 32767.0f);
     }
+    if (carrier_root >= 0 && !fm_carrier_encode(p, carrier_root, pcm, total))
+        fprintf(stderr, "%s: too short for an FM carrier header\n", path);
+    for (int i = 0; i < total; i++)
+        put16(f, pcm[i]);
     fclose(f);
+    free(pcm);
     free(x);
     return pk;
 }
@@ -94,7 +109,7 @@ int main(int argc, char **argv)
                     if (*c == ' ' || *c == '.')
                         *c = '_';
                 snprintf(path, sizeof path, "%s/%s-%d.wav", argv[2], name, note);
-                float pk = render_wav(&p, midi_hz(note), 0.8f, SR, 3 * SR, path);
+                float pk = render_wav(&p, midi_hz(note), 0.8f, SR, 3 * SR, path, -1);
                 printf("%s  peak %.2f\n", path, pk);
             }
         }
@@ -112,7 +127,7 @@ int main(int argc, char **argv)
             fm_preset_get(fm_preset_find(S[i].preset), &p);
             char path[512];
             snprintf(path, sizeof path, "%s/%s.wav", argv[2], S[i].file);
-            float pk = render_wav(&p, midi_hz(60), 0.9f, (int)(S[i].hold * SR), (int)(S[i].total * SR), path);
+            float pk = render_wav(&p, midi_hz(60), 0.9f, (int)(S[i].hold * SR), (int)(S[i].total * SR), path, 60);
             printf("%s  peak %.2f\n", path, pk);
         }
         return 0;
@@ -128,7 +143,7 @@ int main(int argc, char **argv)
         return 2;
     }
     float pk = render_wav(&p, midi_hz(atoi(argv[2])), (float)atof(argv[3]), (int)(atof(argv[4]) * SR),
-                          (int)(atof(argv[5]) * SR), argv[6]);
+                          (int)(atof(argv[5]) * SR), argv[6], -1);
     printf("%s  peak %.2f\n", argv[6], pk);
     return pk < 0;
 }

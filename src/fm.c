@@ -35,6 +35,7 @@
 
 #include "probe.h"
 #include "version.h"
+#include "voice_hook.h"
 
 #ifndef MPCFM_TARGET_EXE
 #define MPCFM_TARGET_EXE "/usr/bin/MPC Sample"
@@ -51,6 +52,24 @@ static char g_logdir[256];
 static char g_preload[512];
 static char g_buildid[2 * 32 + 1] = "none";
 static int g_qol_loaded;
+static uintptr_t g_app_base;
+static char g_hook_msg[160] = "not tried";
+static int g_hooks_on;
+
+/* Stock app builds we know (code hooks only run on these). */
+static const struct {
+    const char *build_id, *firmware;
+} KNOWN_APPS[] = {
+    {"1dac7f481a0fe8d128e435ace88d7e6aece0c9c9", "1.3.0.12"},
+};
+
+static const char *known_firmware(void)
+{
+    for (size_t i = 0; i < sizeof KNOWN_APPS / sizeof *KNOWN_APPS; i++)
+        if (strcmp(g_buildid, KNOWN_APPS[i].build_id) == 0)
+            return KNOWN_APPS[i].firmware;
+    return NULL;
+}
 
 /* ---- helpers (logger thread and constructor only) ---- */
 
@@ -149,6 +168,7 @@ static int phdr_cb(struct dl_phdr_info *info, size_t size, void *data)
     (void)size;
     int *index = data;
     if ((*index)++ == 0) { /* the first object is the main program */
+        g_app_base = (uintptr_t)info->dlpi_addr;
         for (int i = 0; i < info->dlpi_phnum; i++) {
             const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
             if (ph->p_type != PT_NOTE)
@@ -333,9 +353,10 @@ static void status_audio(sbuf *b)
         if (!atomic_load(&s->pcm))
             continue;
         any = 1;
-        fn_window w[FN_COUNT];
-        uint64_t win = 0;
-        int ok = probe_snapshot(s, w, &win);
+        static probe_view v; /* logger thread only */
+        int ok = probe_snapshot(s, &v);
+        const fn_window *w = v.win;
+        uint64_t win = v.epoch;
         int stream = atomic_load(&s->stream), tid = atomic_load(&s->tid);
         uint64_t xr = atomic_load(&s->xrun_results), rc = atomic_load(&s->recovers);
         const char *dir = stream == 0 ? "playback" : stream == 1 ? "capture" : "?";
@@ -346,7 +367,7 @@ static void status_audio(sbuf *b)
                   (unsigned long long)xr, (unsigned long long)rc,
                   !ok ? " (busy)" : win + 2 < epoch ? " (no calls lately)" : "");
 
-        if (!g_memo[i].seen) {
+        if (!g_memo[i].seen && tid != 0) { /* tid is known after the first I/O call */
             g_memo[i].seen = 1;
             event("pcm%d \"%s\" %s first used by tid %d (%s)", i, s->name, dir, tid,
                   thread_comm(tid));
@@ -373,6 +394,17 @@ static void status_audio(sbuf *b)
             for (int h = 0; h < PROBE_HIST; h++)
                 sb_printf(b, " %llu", (unsigned long long)x->gap_hist[h]);
             sb_printf(b, "\n");
+            const fn_window *t = &v.sess[f];
+            if (t->calls) {
+                sb_printf(b, "    since start: %llu calls | gap avg %.3f max %.3f ms (at ~%llu s)"
+                             " | cycle max %.3f ms | gap hist",
+                          (unsigned long long)t->calls,
+                          t->gap_n ? ms(t->gap_sum_ns / t->gap_n) : 0.0, ms(t->gap_max_ns),
+                          (unsigned long long)v.worst_epoch[f], ms(t->cycle_max_ns));
+                for (int h = 0; h < PROBE_HIST; h++)
+                    sb_printf(b, " %llu", (unsigned long long)t->gap_hist[h]);
+                sb_printf(b, "\n");
+            }
             if (stream == 0 && (f == FN_WRITEI || f == FN_WRITEN || f == FN_MMAP_COMMIT) &&
                 x->gap_max_ns > LATE_GAP_NS)
                 event("late block on pcm%d: gap max %.2f ms before %s", i, ms(x->gap_max_ns),
@@ -398,16 +430,67 @@ static void status_threads(sbuf *b)
     }
 }
 
+static uint64_t g_prev_blocks, g_prev_ns;
+
+static void status_fm(sbuf *b)
+{
+    sb_printf(b, "--- FM voices ---\nhooks: %s\n", g_hook_msg);
+    if (!g_hooks_on)
+        return;
+    uint64_t blocks = atomic_load(&vh_stats.fm_blocks), ns = atomic_load(&vh_stats.fm_ns);
+    uint64_t db = blocks - g_prev_blocks, dn = ns - g_prev_ns;
+    g_prev_blocks = blocks;
+    g_prev_ns = ns;
+    sb_printf(b,
+              "sample starts %llu, FM notes %llu, FM voices now %d, damaged headers %llu,"
+              " no free FM voice %llu\n",
+              (unsigned long long)atomic_load(&vh_stats.starts),
+              (unsigned long long)atomic_load(&vh_stats.fm_starts), atomic_load(&vh_stats.active),
+              (unsigned long long)atomic_load(&vh_stats.bad_headers),
+              (unsigned long long)atomic_load(&vh_stats.no_slot));
+    sb_printf(b,
+              "FM render: %llu calls in the last 1 s, avg %.1f us per call, max %.1f us since start;"
+              " last pitch ratio %.3f (root note %d)\n",
+              (unsigned long long)db, db ? (double)dn / (double)db / 1e3 : 0.0,
+              (double)atomic_load(&vh_stats.fm_max_ns) / 1e3,
+              atomic_load(&vh_stats.last_ratio_milli) / 1000.0, atomic_load(&vh_stats.last_root));
+    sb_printf(b, "last sample started, first frames x32768:");
+    for (int i = 0; i < 8; i++) {
+        int v = atomic_load(&vh_stats.last_first[i]);
+        sb_printf(b, " %d(%d)", v, v & 15);
+    }
+    sb_printf(b, "\n  (value(low nibble); an FM carrier's nibbles are 13 4 0 5 6 4 13 4)\n");
+}
+
+/* SampQOL's own log, copied to the card: to see if both mods get along. */
+static void copy_qol_log(void)
+{
+    static char buf[64 * 1024];
+    int fd = open("/tmp/mpcqol.log", O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return;
+    off_t size = lseek(fd, 0, SEEK_END);
+    off_t from = size > (off_t)sizeof buf ? size - (off_t)sizeof buf : 0;
+    ssize_t n = pread(fd, buf, sizeof buf, from);
+    close(fd);
+    if (n > 0)
+        write_atomic(g_logdir, "mpcqol-log-copy.txt", buf, (size_t)n);
+}
+
 static void build_status(sbuf *b, long up_s)
 {
-    sb_printf(b, "mpc-fm %s (phase 0: measures only, no sound)  pid %d  up %ld s\n",
+    sb_printf(b, "mpc-fm %s (FM pads: phase 1 prototype)  pid %d  up %ld s\n",
               MPCFM_VERSION, getpid(), up_s);
-    sb_printf(b, "app build-id %s  SampQOL loaded: %s\n", g_buildid, g_qol_loaded ? "yes" : "no");
+    const char *fw = known_firmware();
+    sb_printf(b, "app build-id %s (%s%s)  SampQOL loaded: %s\n", g_buildid,
+              fw ? "firmware " : "UNKNOWN build: hooks stay off", fw ? fw : "",
+              g_qol_loaded ? "yes" : "no");
     sb_printf(b, "LD_PRELOAD=%s\n", g_preload);
     status_clocks(b);
     status_memory(b);
     scan_threads();
     status_audio(b);
+    status_fm(b);
     status_threads(b);
 }
 
@@ -423,6 +506,7 @@ static void *logger_main(void *arg)
         mkdir(g_logdir, 0755);
     event("start mpc-fm %s pid %d, app build-id %s, SampQOL %s", MPCFM_VERSION, getpid(),
           g_buildid, g_qol_loaded ? "loaded" : "NOT loaded");
+    event("FM hooks: %s", g_hook_msg);
 
     char *buf = malloc(STATUS_CAP);
     if (!buf)
@@ -438,6 +522,8 @@ static void *logger_main(void *arg)
         write_atomic(g_tmpdir, "status.txt", buf, b.len);
         if (g_logdir[0] && (tick == 1 || tick % SD_EVERY_S == 0))
             write_atomic(g_logdir, "mpcfm-status.txt", buf, b.len);
+        if (g_logdir[0] && (tick == 20 || tick % 60 == 0))
+            copy_qol_log();
     }
     return NULL;
 }
@@ -465,6 +551,15 @@ __attribute__((constructor)) static void mpcfm_init(void)
 
     v = getenv("MPCFM_PROBE");
     probe_init(!(v && strcmp(v, "0") == 0));
+
+    /* Before the app starts its threads: swap the sample voice methods. */
+    v = getenv("MPCFM_HOOKS");
+    if (v && strcmp(v, "0") == 0)
+        snprintf(g_hook_msg, sizeof g_hook_msg, "off (MPCFM_HOOKS=0)");
+    else if (!known_firmware())
+        snprintf(g_hook_msg, sizeof g_hook_msg, "off: unknown app build");
+    else
+        g_hooks_on = vh_install(g_app_base, g_buildid, g_hook_msg, sizeof g_hook_msg);
 
     pthread_attr_t a;
     pthread_t th;

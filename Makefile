@@ -29,10 +29,13 @@ SO_FLAGS = -shared -fPIC -fvisibility=hidden -Wl,--build-id=sha1
 # No -ffast-math: sanitize() relies on NaN checks.
 ENGINE_FLAGS = -O3 -fno-math-errno -ffp-contract=fast -Isrc/fm
 
-FM_SRC = src/fm.c src/alsa_probe.c
-FM_HDR = src/probe.h src/version.h
-ENGINE_SRC = src/fm/fm_engine.c src/fm/fm_presets.c
-ENGINE_HDR = src/fm/fm_engine.h src/fm/fm_presets.h
+ENGINE_SRC = src/fm/fm_engine.c src/fm/fm_presets.c src/fm/fm_carrier.c
+ENGINE_HDR = src/fm/fm_engine.h src/fm/fm_presets.h src/fm/fm_carrier.h
+FM_SRC = src/fm.c src/alsa_probe.c src/voice_hook.c src/fm/fm_engine.c src/fm/fm_carrier.c
+FM_HDR = src/probe.h src/version.h src/voice_hook.h $(ENGINE_HDR)
+# fm.so: the engine runs in it, so the engine flags; BTI/PAC landing pads
+# like the stock app (no-ops on the A55).
+FM_FLAGS = $(ENGINE_FLAGS) -Isrc
 SHIM_SRC = launcher/setarch.c launcher/strip.c
 SHIM_HDR = launcher/strip.h launcher/font.h src/version.h
 SHIM_FLAGS = -Isrc -Ilauncher
@@ -53,7 +56,8 @@ arm: $(ARM)/fm.so $(ARM)/setarch $(ARM)/fmbench
 
 $(ARM)/fm.so: $(FM_SRC) $(FM_HDR) | $(ZIG)
 	@mkdir -p $(@D)
-	$(CC_ARM) $(CFLAGS) $(SO_FLAGS) -o $@ $(FM_SRC) -ldl -lpthread
+	$(CC_ARM) $(CFLAGS) $(SO_FLAGS) $(FM_FLAGS) -mbranch-protection=standard -o $@ $(FM_SRC) \
+		-ldl -lpthread -lm
 
 $(ARM)/setarch: $(SHIM_SRC) $(SHIM_HDR) | $(ZIG)
 	@mkdir -p $(@D)
@@ -67,12 +71,18 @@ dist: arm
 	sh tools/mkdist.sh $(ARM) dist
 
 # ---- host build and tests ----
-host: $(HOST)/fm.so $(HOST)/setarch $(HOST)/fake_app $(HOST)/test_fm $(HOST)/fmbench $(HOST)/fmrender
+host: $(HOST)/fm.so $(HOST)/setarch $(HOST)/fake_app $(HOST)/test_fm $(HOST)/test_hook \
+	$(HOST)/fmbench $(HOST)/fmrender
 
 $(HOST)/fm.so: $(FM_SRC) $(FM_HDR)
 	@mkdir -p $(@D)
-	$(CC_HOST) $(CFLAGS) $(SO_FLAGS) -DMPCFM_TARGET_EXE='"$(abspath $(HOST)/fake_app)"' \
-		-o $@ $(FM_SRC) -ldl -lpthread
+	$(CC_HOST) $(CFLAGS) $(SO_FLAGS) $(FM_FLAGS) -DMPCFM_TARGET_EXE='"$(abspath $(HOST)/fake_app)"' \
+		-o $@ $(FM_SRC) -ldl -lpthread -lm
+
+$(HOST)/test_hook: tests/test_hook.c src/voice_hook.c src/voice_hook.h $(ENGINE_SRC) $(ENGINE_HDR)
+	@mkdir -p $(@D)
+	$(CC_HOST) $(CFLAGS) -DMPCFM_TEST $(FM_FLAGS) -o $@ tests/test_hook.c \
+		src/voice_hook.c $(ENGINE_SRC) -lm
 
 $(HOST)/setarch: $(SHIM_SRC) $(SHIM_HDR)
 	@mkdir -p $(@D)
@@ -99,6 +109,7 @@ $(HOST)/fmrender: tools/fmrender.c $(ENGINE_SRC) $(ENGINE_HDR)
 
 check: host
 	$(HOST)/test_fm
+	$(HOST)/test_hook
 	sh tests/test_launcher.sh $(HOST)/setarch
 	sh tests/test_autorun.sh $(HOST)
 	sh tests/test_probe.sh $(HOST)

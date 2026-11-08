@@ -40,10 +40,15 @@ typedef struct {
     uint64_t last_entry_ns[FN_COUNT];
     fn_window cur[FN_COUNT];
 
+    fn_window sess[FN_COUNT];          /* since the start */
+    uint64_t sess_worst_epoch[FN_COUNT]; /* window with the largest gap */
+
     /* Published copy, guarded by seq (odd while it is written). */
     _Atomic uint32_t seq;
     uint64_t done_epoch;
     fn_window done[FN_COUNT];
+    fn_window done_sess[FN_COUNT];
+    uint64_t done_worst_epoch[FN_COUNT];
 } probe_slot;
 
 /* Gap is the time on a thread from the return of its previous PCM call to
@@ -60,7 +65,15 @@ extern const char *const probe_fn_name[FN_COUNT];
 /* Resolve the real ALSA functions. active = 0: pass calls through only. */
 void probe_init(int active);
 
-/* Copy the last published window of a slot. Returns 0 if it stayed busy. */
-int probe_snapshot(probe_slot *s, fn_window out[FN_COUNT], uint64_t *epoch);
+/* Copy the last published window of a slot, the totals since the start and
+ * the window of the worst gap (epochs: about one per second). Returns 0 if
+ * the slot stayed busy. */
+typedef struct {
+    fn_window win[FN_COUNT];
+    fn_window sess[FN_COUNT];
+    uint64_t worst_epoch[FN_COUNT];
+    uint64_t epoch;
+} probe_view;
+int probe_snapshot(probe_slot *s, probe_view *out);
 
 #endif

@@ -4,8 +4,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "fm_carrier.h"
 #include "fm_engine.h"
 #include "fm_presets.h"
+#include <stdint.h>
 
 #define SR 44100.0f
 #define MAXN (44100 * 4)
@@ -250,6 +252,43 @@ int main(void)
     CHECK(p.op[0].ratio == 1.0f && p.op[1].attack == 0.0005f && p.op[2].level == 1.0f &&
               p.algorithm == 0 && p.gain == 2.0f,
           "sanitize: NaN to default, out of range clamped");
+
+    /* carrier header: round trip through int16 -> float, both scales */
+    {
+        static int16_t pcm[4096];
+        fm_patch a, b;
+        fm_preset_get(fm_preset_find("Bell"), &a);
+        for (int i = 0; i < 4096; i++)
+            pcm[i] = (int16_t)lrintf(20000.0f * sinf(0.05f * (float)i));
+        CHECK(fm_carrier_encode(&a, 57, pcm, 4096), "carrier: %d frames of header written", FM_CARRIER_FRAMES);
+        int maxdev = 0;
+        for (int i = 0; i < FM_CARRIER_FRAMES; i++) {
+            int dev = abs(pcm[i] - (int)lrintf(20000.0f * sinf(0.05f * (float)i)));
+            maxdev = dev > maxdev ? dev : maxdev;
+        }
+        CHECK(maxdev <= 15, "carrier: audio changed by at most %d LSB (-66 dB)", maxdev);
+        int root = 0;
+        for (int i = 0; i < 4096; i++) buf[i] = pcm[i] / 32768.0f;
+        int r1 = fm_carrier_decode(buf, 4096, &b, &root);
+        CHECK(r1 == 1 && root == 57 && memcmp(&a, &b, sizeof a) == 0, "carrier: decoded (/32768): same patch, root %d", root);
+        for (int i = 0; i < 4096; i++) buf[i] = pcm[i] / 32767.0f;
+        int r2 = fm_carrier_decode(buf, 4096, &b, &root);
+        CHECK(r2 == 1 && memcmp(&a, &b, sizeof a) == 0, "carrier: decoded (/32767): same patch");
+        pcm[200] ^= 4;
+        for (int i = 0; i < 4096; i++) buf[i] = pcm[i] / 32768.0f;
+        CHECK(fm_carrier_decode(buf, 4096, &b, &root) == -1, "carrier: one damaged nibble is caught (CRC)");
+        CHECK(fm_carrier_decode(buf, 100, &b, &root) == -1, "carrier: too short is damaged, not valid");
+        int false_pos = 0;
+        unsigned seed = 7;
+        for (int t = 0; t < 2000; t++) {
+            for (int i = 0; i < 16; i++) {
+                seed = seed * 1103515245u + 12345u;
+                buf[i] = (float)((int)(seed >> 16) % 65536 - 32768) / 32768.0f;
+            }
+            false_pos += fm_carrier_has_magic(buf, 16);
+        }
+        CHECK(false_pos == 0, "carrier: no magic in 2000 random sample starts");
+    }
 
     printf(fails ? "%d failed\n" : "all passed\n", fails);
     return fails != 0;
