@@ -297,18 +297,15 @@ static void claim(void *gen)
     vh_note_t note;
     memset(&note, 0, sizeof note);
     note.kind = provider_kind(gen, &note.sample, &note.vt_off);
-    int found;
-    if (note.kind == VH_KIND_DISK) {
-        /* Streamed: its file was read by the logger (vh_disk_add). */
-        uintptr_t prov = 0;
-        if (note.sample)
-            memcpy(&prov, (char *)note.sample + OFF_PROVIDER, 8);
-        found = disk_lookup(note.sample, prov, &patch, &root);
-        memset(note.nib, 0xff, 8);
-    } else {
-        /* In RAM: the built-in path to the frames. */
+    /* Registered by the logger (its WAV file, or the patch library when
+     * its data lost the header): any kind of sample. */
+    uintptr_t prov = 0;
+    if (note.sample)
+        memcpy(&prov, (char *)note.sample + OFF_PROVIDER, 8);
+    int found = disk_lookup(note.sample, prov, &patch, &root);
+    memset(note.nib, 0xff, 8);
+    if (!found && note.kind == VH_KIND_MEMORY) /* in RAM: the built-in path to the frames */
         found = disc_lookup(gen, &patch, &root, 0, note.nib);
-    }
     note.fm = found;
     note.algorithm = found ? patch.algorithm + 1 : 0;
     uint64_t slot = __atomic_fetch_add(&g_notes_head, 1, __ATOMIC_ACQ_REL);

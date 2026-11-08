@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 
 #include "discover.h"
 #include "sampleinfo.h"
@@ -352,6 +353,50 @@ int main(void)
             remove(path);
         }
         CHECK(carrier_from_file("/nonexistent.wav", &got, &got.algorithm) == -1, "missing file: -1");
+    }
+
+    /* 16. the patch library: FM files on the card, found by a copy's name */
+    {
+        char dir[] = "/tmp/mpcfm-lib-XXXXXX";
+        if (!mkdtemp(dir)) return 1;
+        char sub[300]; snprintf(sub, sizeof sub, "%s/Keys", dir);
+        mkdir(sub, 0755);
+        const char *names[] = {"FM-Bell-C3", "Keys/FM-EPiano-C3", "FM-Fake-C3"};
+        const char *presets[] = {"Bell", "E.Piano", NULL};
+        for (int f = 0; f < 3; f++) {
+            static int16_t pcm[2000];
+            for (int i = 0; i < 2000; i++) pcm[i] = (int16_t)(i * 3);
+            if (presets[f]) {
+                fm_patch pp; fm_preset_get(fm_preset_find(presets[f]), &pp);
+                fm_carrier_encode(&pp, 60, pcm, 2000);
+            }
+            char path[400]; snprintf(path, sizeof path, "%s/%s.wav", dir, names[f]);
+            FILE *w = fopen(path, "wb");
+            uint32_t v32; uint16_t v16;
+            fwrite("RIFF", 1, 4, w); v32 = 36 + 4000; fwrite(&v32, 4, 1, w); fwrite("WAVEfmt ", 1, 8, w);
+            v32 = 16; fwrite(&v32, 4, 1, w); v16 = 1; fwrite(&v16, 2, 1, w); fwrite(&v16, 2, 1, w);
+            v32 = 44100; fwrite(&v32, 4, 1, w); v32 = 88200; fwrite(&v32, 4, 1, w); v16 = 2; fwrite(&v16, 2, 1, w);
+            v16 = 16; fwrite(&v16, 2, 1, w); fwrite("data", 1, 4, w); v32 = 4000; fwrite(&v32, 4, 1, w);
+            fwrite(pcm, 2, 2000, w);
+            fclose(w);
+        }
+        const char *dirs[1] = {dir};
+        int n = library_scan(dirs, 1);
+        CHECK(n == 2, "library: 2 carriers indexed (a sub-folder included, a non-carrier FM- file left out): %d", n);
+        fm_patch got, want; int root = 0; char found[300];
+        fm_preset_get(fm_preset_find("Bell"), &want);
+        CHECK(library_find("FM-Bell-C3.wav", &got, &root, found, sizeof found) && !memcmp(&got, &want, sizeof got),
+              "library: exact name");
+        CHECK(library_find("FM-Bell-C3002.wav", &got, &root, found, sizeof found) && !memcmp(&got, &want, sizeof got),
+              "library: the MPC's copy name (3 digits added) finds the original");
+        fm_preset_get(fm_preset_find("E.Piano"), &want);
+        CHECK(library_find("/data/TempProjects/T_[ProjectData]/FM-EPiano-C3001002.wav", &got, &root, found, sizeof found) &&
+                  !memcmp(&got, &want, sizeof got) && strstr(found, "Keys/FM-EPiano-C3.wav"),
+              "library: a path, twice-copied name -> %s", found);
+        CHECK(!library_find("FM-Other-C3.wav", &got, &root, found, sizeof found), "library: unknown name not found");
+        CHECK(!library_find("FM-Bell-C9.wav", &got, &root, found, sizeof found), "library: a near name is not a match");
+        char cmd[400]; snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);
+        if (system(cmd) != 0) printf("(could not remove %s)\n", dir);
     }
 
     /* 9. vh_install: checks the 16 stock entries, swaps 0, 3 and 7 */

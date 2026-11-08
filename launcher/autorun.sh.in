@@ -89,8 +89,9 @@ if [ "$SHIM" = 1 ]; then
     MPCFM_BIN="$RUN/bin"
     MPCFM_STATE="$RUN"
     MPCFM_LOGDIR="$DIR/logs"
+    MPCFM_CARD="$ROOT" # where the FM files are (the patch library)
     PATH="$RUN/bin:$PATH"
-    export MPCFM_BIN MPCFM_STATE MPCFM_LOGDIR PATH
+    export MPCFM_BIN MPCFM_STATE MPCFM_LOGDIR MPCFM_CARD PATH
     if [ -z "$OFF" ]; then
         MPCFM_SO="$RUN/fm.so"
         export MPCFM_SO

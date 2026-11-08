@@ -5,7 +5,7 @@ mpc-fm is a separate project. It does not contain SampQOL OS and does not
 change any SampQOL file. Get SampQOL OS only from its official page:
 https://github.com/snarebes/SampQOL-OS/releases
 
-Version 0.1.4: FM pads (prototype). The files in MPC-FM-Samples are
+Version 0.1.7: FM pads (prototype). The files in MPC-FM-Samples are
 "FM carriers": each one is a recording of an FM sound with the FM patch
 hidden inside it. Load one on a pad: with mpc-fm, the pad plays the live FM
 engine; without mpc-fm (or on another MPC) it plays the recording.
@@ -54,8 +54,12 @@ Limits of this prototype:
 - Velocity changes the volume (stock), not yet the FM brightness.
 - A note lasts at most as long as the file (E.Piano 4 s, Bell 6 s...), as
   for a sample in One Shot mode.
-- Do not edit the file in the MPC (trim, normalize, chop): it then plays as
-  a normal recording. The same with Warp / time-stretch on the pad.
+- Saving a project: the MPC rewrites its copy of the sample and the
+  hidden patch is lost. mpc-fm then takes the patch from the original
+  file of the same name on the card (MPC-FM-Samples, or MPC-Sample/Samples):
+  keep the FM files there, and do not rename them.
+- Editing the file in the MPC (trim, normalize, chop) changes the sound of
+  the recording only; Warp / time-stretch on the pad plays the recording.
 
 Results
 -------

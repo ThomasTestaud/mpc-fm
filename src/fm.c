@@ -16,6 +16,7 @@
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <elf.h>
+#include <math.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <link.h>
@@ -447,24 +448,79 @@ typedef struct {
     char name[64];
 } sample_row;
 
-/* A streamed sample seen for the first time: is its file a carrier? */
+/* A sample seen for the first time without FM: is it an FM file after
+ * all? A streamed one: read the header from its WAV file. Any one named
+ * "FM-...": if its data lost the header (the MPC rewrites samples when it
+ * saves), take the patch from the library (the FM files on the card). */
 static struct {
     uintptr_t sample, provider, name_ptr;
 } g_inspected[64];
 static int g_ninspected;
+static char g_card[256];
+static long g_lib_scanned_tick = -1000;
+static long g_tick_now;
 
-static void inspect_disk(uintptr_t sample)
+static void scan_library(void)
+{
+    if (!g_card[0])
+        return;
+    char a[300], b[300];
+    snprintf(a, sizeof a, "%s/MPC-FM-Samples", g_card);
+    snprintf(b, sizeof b, "%s/MPC-Sample/Samples", g_card);
+    const char *dirs[2] = {a, b};
+    int n = library_scan(dirs, 2);
+    g_lib_scanned_tick = g_tick_now;
+    event("patch library: %d FM files on the card", n);
+}
+
+/* What did the MPC change in its copy? (once per file, for the logs) */
+static void compare_copy(const char *copy, const char *orig, const char *name)
+{
+    static float a[FM_CARRIER_FRAMES + 64], o[FM_CARRIER_FRAMES + 64];
+    wav_info ia, io;
+    int na = wav_read_head(copy, a, FM_CARRIER_FRAMES + 64, &ia);
+    int no = wav_read_head(orig, o, FM_CARRIER_FRAMES + 64, &io);
+    if (na < FM_CARRIER_FRAMES || no < FM_CARRIER_FRAMES) {
+        event("copy of \"%s\": cannot compare (copy %d frames, original %d)", name, na, no);
+        return;
+    }
+    int best = 0;
+    double best_d = 1e30;
+    for (int sh = -32; sh <= 32; sh++) { /* frames moved? */
+        double d = 0;
+        for (int i = 64; i < FM_CARRIER_FRAMES - 64; i++)
+            d += fabs((double)a[i + sh] - o[i]);
+        if (d < best_d)
+            best_d = d, best = sh;
+    }
+    double ea = 0, eo = 0, maxd = 0;
+    for (int i = 64; i < FM_CARRIER_FRAMES - 64; i++) {
+        ea += (double)a[i + best] * a[i + best];
+        eo += (double)o[i] * o[i];
+        double d = fabs((double)a[i + best] - o[i]) * 32768.0;
+        maxd = d > maxd ? d : maxd;
+    }
+    event("copy of \"%s\": %d-bit fmt %d, %d ch, %d Hz, %ld frames (original %d-bit, %ld frames);"
+          " shift %d frames, level x%.4f, max difference %.1f LSB16",
+          name, ia.bits, ia.format, ia.channels, ia.rate, ia.frames, io.bits, io.frames, best,
+          eo > 0 ? sqrt(ea / eo) : 0.0, maxd);
+}
+
+static void inspect_sample(uintptr_t sample, int kind)
 {
     uintptr_t prov = 0;
     if (disc_read(&prov, sample + 368, 8) != 0)
         return;
     name_loc l;
-    if (!sample_name_loc(sample, &l) || !strchr(l.path, '/'))
+    if (!sample_name_loc(sample, &l))
         return;
     for (int i = 0; i < g_ninspected; i++)
         if (g_inspected[i].sample == sample && g_inspected[i].provider == prov &&
             g_inspected[i].name_ptr == l.ptr)
             return; /* done already */
+    int fm_named = !strncmp(l.base, "FM-", 3);
+    if (!fm_named && kind != VH_KIND_DISK)
+        return; /* a normal sample in RAM: nothing to read */
     if (g_ninspected < 64) {
         g_inspected[g_ninspected].sample = sample;
         g_inspected[g_ninspected].provider = prov;
@@ -472,17 +528,32 @@ static void inspect_disk(uintptr_t sample)
     }
     fm_patch p;
     int root = 60;
-    int r = carrier_from_file(l.path, &p, &root);
+    int r = strchr(l.path, '/') ? carrier_from_file(l.path, &p, &root) : -1;
     if (r == 1) {
         vh_disk_add(sample, prov, l.i, l.obj, l.k, l.ptr, &p, root);
-        event("streamed sample \"%s\": FM carrier (algorithm %d), live from the next note", l.base,
-              p.algorithm + 1);
-    } else if (r < 0) {
-        event("streamed sample \"%s\": cannot read %s", l.base, l.path);
-    } else if (!strncmp(l.base, "FM-", 3)) {
-        /* An FM file whose copy has no header: the MPC changed the data? */
-        event("streamed sample \"%s\": no FM header in its file %s", l.base, l.path);
+        event("sample \"%s\" (%s): FM header read from its file, live from the next note", l.base,
+              vh_kind_name(kind));
+        return;
     }
+    if (!fm_named)
+        return;
+    char orig[256];
+    int found = library_find(l.base, &p, &root, orig, sizeof orig);
+    if (!found && g_tick_now - g_lib_scanned_tick > 30) { /* a new file on the card? */
+        scan_library();
+        found = library_find(l.base, &p, &root, orig, sizeof orig);
+    }
+    if (!found) {
+        event("sample \"%s\" (%s): no FM header, and no \"%s\" in the patch library", l.base,
+              vh_kind_name(kind), l.base);
+        return;
+    }
+    vh_disk_add(sample, prov, l.i, l.obj, l.k, l.ptr, &p, root);
+    const char *ob = strrchr(orig, '/');
+    event("sample \"%s\" (%s): its data lost the FM header; patch from the library (%s), live from"
+          " the next note", l.base, vh_kind_name(kind), ob ? ob + 1 : orig);
+    if (strchr(l.path, '/'))
+        compare_copy(l.path, orig, l.base);
 }
 
 static sample_row g_samples[24];
@@ -510,8 +581,8 @@ static void note_rows(void)
         }
         if (!r)
             continue;
-        if (t->kind == VH_KIND_DISK && !t->fm)
-            inspect_disk(t->sample);
+        if (!t->fm)
+            inspect_sample(t->sample, t->kind);
         r->starts++;
         r->fm += t->fm != 0;
         memcpy(r->nib, t->nib, 8);
@@ -576,7 +647,8 @@ static void status_fm(sbuf *b)
             sb_printf(b, " %d", r->nib[k] == 0xff ? -1 : r->nib[k]);
         sb_printf(b, "\n");
     }
-    sb_printf(b, "searches run: %u; streamed FM carriers known: %d\n", disc_searches(), vh_disk_count());
+    sb_printf(b, "searches run: %u; FM samples known by file or library: %d; patch library: %d files\n",
+              disc_searches(), vh_disk_count(), library_count());
     disc_path_t paths[4];
     int n = disc_paths(paths, 4);
     if (!n)
@@ -650,6 +722,9 @@ static void *logger_main(void *arg)
             write_atomic(g_logdir, "mpcfm-status.txt", buf, b.len);
         if (g_logdir[0] && (tick == 20 || tick % 60 == 0))
             copy_qol_log();
+        g_tick_now = tick;
+        if (tick == 3)
+            scan_library();
         if (tick == 5) { /* after SampQOL has put its own crash handler */
             char path[300], m[200];
             snprintf(path, sizeof path, "%s/%s", g_logdir[0] ? g_logdir : g_tmpdir, "mpcfm-crash.log");
@@ -686,6 +761,9 @@ __attribute__((constructor)) static void mpcfm_init(void)
         snprintf(g_logdir, sizeof g_logdir, "%s", v);
     v = getenv("LD_PRELOAD");
     snprintf(g_preload, sizeof g_preload, "%s", v ? v : "");
+    v = getenv("MPCFM_CARD");
+    if (v && *v)
+        snprintf(g_card, sizeof g_card, "%s", v);
 
     int index = 0;
     dl_iterate_phdr(phdr_cb, &index);

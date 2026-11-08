@@ -24,4 +24,25 @@ void sample_name(uintptr_t sample, char *out, size_t cap);
  * first channel). 1: a carrier, *p and *root set; 0: not; -1: unreadable. */
 int carrier_from_file(const char *path, fm_patch *p, int *root);
 
+/* ---- the patch library: the FM files on the card ----
+ * A pad's copy of an FM file can lose its hidden patch (the MPC rewrites
+ * samples when it saves a project). The original files on the card keep
+ * it: index them, and find a patch by file name. */
+
+/* Index the carriers under these folders (depth <= 3). Returns how many. */
+int library_scan(const char *const *dirs, int ndirs);
+int library_count(void);
+/* The patch for a sample file name ("FM-Bass-C3002.wav" finds
+ * "FM-Bass-C3.wav": the MPC adds 3 digits to copies). 1 if found; found:
+ * the library file's path. */
+int library_find(const char *name, fm_patch *p, int *root, char *found, size_t cap);
+
+/* The first frames of a WAV file as floats (first channel), and its format.
+ * Returns the number of frames read (0: not a WAV we can read). */
+typedef struct {
+    int format, channels, bits, rate;
+    long frames;
+} wav_info;
+int wav_read_head(const char *path, float *out, int n, wav_info *info);
+
 #endif

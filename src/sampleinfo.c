@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 #include "discover.h"
@@ -96,29 +97,29 @@ void sample_name(uintptr_t sample, char *out, size_t cap)
     out[n] = 0;
 }
 
-/* The carrier header from a WAV file: 16/24/32-bit PCM or float, first
- * channel. 1: a carrier (patch set), 0: not, -1: cannot read. */
-int carrier_from_file(const char *path, fm_patch *p, int *root)
+int wav_read_head(const char *path, float *out, int nwant, wav_info *info)
 {
     static unsigned char buf[65536];
+    memset(info, 0, sizeof *info);
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0)
-        return -1;
+        return 0;
     ssize_t n = read(fd, buf, sizeof buf);
     close(fd);
     if (n < 44 || memcmp(buf, "RIFF", 4) || memcmp(buf + 8, "WAVE", 4))
-        return -1;
-    int fmt = 0, channels = 0, bits = 0;
+        return 0;
     size_t data = 0, data_len = 0;
     for (size_t o = 12; o + 8 <= (size_t)n;) {
         uint32_t len = (uint32_t)buf[o + 4] | (uint32_t)buf[o + 5] << 8 | (uint32_t)buf[o + 6] << 16 |
                        (uint32_t)buf[o + 7] << 24;
         if (!memcmp(buf + o, "fmt ", 4) && o + 24 <= (size_t)n) {
-            fmt = buf[o + 8] | buf[o + 9] << 8;
-            channels = buf[o + 10] | buf[o + 11] << 8;
-            bits = buf[o + 22] | buf[o + 23] << 8;
-            if (fmt == 0xfffe && o + 34 <= (size_t)n) /* extensible: the subformat */
-                fmt = buf[o + 32] | buf[o + 33] << 8;
+            info->format = buf[o + 8] | buf[o + 9] << 8;
+            info->channels = buf[o + 10] | buf[o + 11] << 8;
+            info->rate = (int)((uint32_t)buf[o + 12] | (uint32_t)buf[o + 13] << 8 |
+                               (uint32_t)buf[o + 14] << 16 | (uint32_t)buf[o + 15] << 24);
+            info->bits = buf[o + 22] | buf[o + 23] << 8;
+            if (info->format == 0xfffe && o + 34 <= (size_t)n) /* extensible: the subformat */
+                info->format = buf[o + 32] | buf[o + 33] << 8;
         } else if (!memcmp(buf + o, "data", 4)) {
             data = o + 8;
             data_len = len;
@@ -126,29 +127,135 @@ int carrier_from_file(const char *path, fm_patch *p, int *root)
         }
         o += 8 + len + (len & 1);
     }
-    if (!data || channels < 1 || (bits != 16 && bits != 24 && bits != 32))
-        return -1;
-    size_t frame = (size_t)channels * (size_t)(bits / 8);
-    static float f[FM_CARRIER_FRAMES];
-    if (data_len < frame * FM_CARRIER_FRAMES || data + frame * FM_CARRIER_FRAMES > (size_t)n)
+    int bits = info->bits;
+    if (!data || info->channels < 1 || (bits != 16 && bits != 24 && bits != 32))
         return 0;
-    for (int i = 0; i < FM_CARRIER_FRAMES; i++) {
+    size_t frame = (size_t)info->channels * (size_t)(bits / 8);
+    info->frames = (long)(data_len / frame);
+    int got = 0;
+    for (int i = 0; i < nwant; i++, got++) {
+        if ((size_t)(i + 1) * frame > data_len || data + (size_t)(i + 1) * frame > (size_t)n)
+            break;
         const unsigned char *q = buf + data + (size_t)i * frame;
         if (bits == 16) {
             int16_t v;
             memcpy(&v, q, 2);
-            f[i] = (float)v / 32768.0f;
+            out[i] = (float)v / 32768.0f;
         } else if (bits == 24) {
             int32_t v = (int32_t)((uint32_t)q[0] << 8 | (uint32_t)q[1] << 16 | (uint32_t)q[2] << 24) >> 8;
-            f[i] = (float)v / 8388608.0f;
-        } else if (fmt == 3) {
-            memcpy(&f[i], q, 4);
+            out[i] = (float)v / 8388608.0f;
+        } else if (info->format == 3) {
+            memcpy(&out[i], q, 4);
         } else {
             int32_t v;
             memcpy(&v, q, 4);
-            f[i] = (float)((double)v / 2147483648.0);
+            out[i] = (float)((double)v / 2147483648.0);
         }
     }
+    return got;
+}
+
+int carrier_from_file(const char *path, fm_patch *p, int *root)
+{
+    static float f[FM_CARRIER_FRAMES];
+    wav_info info;
+    int n = wav_read_head(path, f, FM_CARRIER_FRAMES, &info);
+    if (!n && !info.bits)
+        return -1;
+    if (n < FM_CARRIER_FRAMES)
+        return 0;
     return fm_carrier_decode(f, FM_CARRIER_FRAMES, p, root) == 1;
+}
+
+/* ---- the library ---- */
+#include <dirent.h>
+#include <sys/stat.h>
+
+#define LIB_MAX 512
+static struct {
+    char base[64]; /* file name without ".wav" */
+    char path[256];
+    fm_patch patch;
+    int root;
+} g_lib[LIB_MAX];
+static int g_nlib;
+
+int library_count(void) { return g_nlib; }
+
+static void scan_dir(const char *dir, int depth)
+{
+    DIR *d = opendir(dir);
+    if (!d)
+        return;
+    struct dirent *e;
+    while ((e = readdir(d)) && g_nlib < LIB_MAX) {
+        if (e->d_name[0] == '.')
+            continue;
+        char path[512];
+        snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
+        size_t len = strlen(e->d_name);
+        struct stat st;
+        if (stat(path, &st) != 0)
+            continue;
+        if (S_ISDIR(st.st_mode)) {
+            if (depth > 0)
+                scan_dir(path, depth - 1);
+            continue;
+        }
+        if (len < 8 || strncmp(e->d_name, "FM-", 3) || strcasecmp(e->d_name + len - 4, ".wav"))
+            continue;
+        fm_patch p;
+        int root = 60;
+        if (carrier_from_file(path, &p, &root) != 1)
+            continue;
+        size_t bl = len - 4 < sizeof g_lib[0].base - 1 ? len - 4 : sizeof g_lib[0].base - 1;
+        int dup = 0;
+        for (int i = 0; i < g_nlib; i++)
+            dup |= strlen(g_lib[i].base) == bl && !strncmp(g_lib[i].base, e->d_name, bl);
+        if (dup)
+            continue; /* the first one found wins */
+        memcpy(g_lib[g_nlib].base, e->d_name, bl);
+        g_lib[g_nlib].base[bl] = 0;
+        size_t pl = strlen(path) < sizeof g_lib[0].path - 1 ? strlen(path) : sizeof g_lib[0].path - 1;
+        memcpy(g_lib[g_nlib].path, path, pl);
+        g_lib[g_nlib].path[pl] = 0;
+        g_lib[g_nlib].patch = p;
+        g_lib[g_nlib].root = root;
+        g_nlib++;
+    }
+    closedir(d);
+}
+
+int library_scan(const char *const *dirs, int ndirs)
+{
+    g_nlib = 0;
+    for (int i = 0; i < ndirs; i++)
+        scan_dir(dirs[i], 3);
+    return g_nlib;
+}
+
+int library_find(const char *name, fm_patch *p, int *root, char *found, size_t cap)
+{
+    char b[96];
+    const char *slash = strrchr(name, '/');
+    snprintf(b, sizeof b, "%s", slash ? slash + 1 : name);
+    size_t len = strlen(b);
+    if (len > 4 && !strcasecmp(b + len - 4, ".wav"))
+        b[len -= 4] = 0;
+    for (int strip = 0; strip <= 2; strip++) { /* "X", then X minus 3 digits, twice */
+        for (int i = 0; i < g_nlib; i++)
+            if (!strcmp(g_lib[i].base, b)) {
+                *p = g_lib[i].patch;
+                *root = g_lib[i].root;
+                if (found)
+                    snprintf(found, cap, "%s", g_lib[i].path);
+                return 1;
+            }
+        if (len < 4 || !(b[len - 1] >= '0' && b[len - 1] <= '9') || !(b[len - 2] >= '0' && b[len - 2] <= '9') ||
+            !(b[len - 3] >= '0' && b[len - 3] <= '9'))
+            break;
+        b[len -= 3] = 0;
+    }
+    return 0;
 }
 
