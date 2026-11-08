@@ -12,6 +12,14 @@ Pad EQ, inserts, mixer, 16 Levels, Keys, export and resample.
 **Status: phase 0.** `fm.so` makes no sound yet. It measures the real audio
 budget on the device (block timing, xruns, CPU use and priority of each
 thread, CPU clocks) so the FM engine can be sized from real numbers.
+At start-up a line under the SampQOL splash shows `mpc-fm 0.0.1  FM on`, or
+why FM is off.
+
+The FM engine (`src/fm/`) is written and tested on the computer, not yet
+wired into the app: 4 operators, 8 algorithms, an envelope per operator,
+feedback on operator 4. No allocation, no locks; the output does not depend
+on how a note is cut into render calls (bit-exact, tested). `fmbench` measures
+it on the MPC's CPU, `fmrender` writes presets to WAV.
 
 ## How it loads
 
@@ -20,10 +28,11 @@ runner checks `autorun.check`). Our launcher is that entry point:
 
 ```
 autorun/autorun.sh (ours)
-  -> autorun/sampqol/autorun.sh      official SampQOL, unchanged (its own checks)
+  -> autorun/<any>/autorun.sh        official SampQOL folder, unchanged (its own checks)
     -> qol-run.sh                    SampQOL watchdog + project safety net
       -> setarch                     OUR static stand-in, first in PATH:
-                                     LD_PRELOAD += /run/mpcfm/fm.so
+                                     LD_PRELOAD += /run/mpcfm/fm.so,
+                                     status line over SampQOL's splash
         -> real setarch -R -> /usr/bin/MPC Sample
              LD_PRELOAD="/tmp/mpcqol.so /run/mpcfm/fm.so"
 ```
@@ -48,6 +57,8 @@ make toolchain   # zig 0.16.0 into .tools/ (pinned, SHA256 checked)
 make check       # host build + tests: launcher, autorun chain, probe
 make arm         # aarch64 build for the device + static checks
 make dist        # SD card folder: dist/autorun/
+make bench       # engine benchmark here (device: build/aarch64/fmbench)
+make wavs        # every preset as WAV in build/wav/
 ```
 
 `zig cc` cross-compiles for aarch64 and links against old glibc symbol
@@ -58,9 +69,13 @@ CPU tuning: `-mcpu=cortex_a55` (Rockchip RK3566).
 |---|---|
 | `src/fm.c` | entry point, status/log thread |
 | `src/alsa_probe.c` | timing wrappers of the ALSA PCM calls |
-| `launcher/` | `autorun.sh` template, `autorun.json`, `setarch` stand-in |
-| `tools/` | toolchain fetch, `autorun.check`, SD folder, aarch64 checks |
-| `tests/` | host tests with a fake ALSA library and fake app |
+| `src/fm/` | FM engine and presets |
+| `launcher/` | `autorun.sh` template, `autorun.json`, `setarch` stand-in, status strip |
+| `tools/` | toolchain fetch, `autorun.check`, SD folder, aarch64 checks, `fmbench`, `fmrender`, font generator |
+| `tests/` | engine unit tests; launcher tests with a fake ALSA library, fake app and fake framebuffer |
+
+The status strip font (`launcher/font.h`) is generated from the X11
+misc-fixed 6x13 font (public domain) by `tools/gen-font.py`.
 
 ## Rules
 

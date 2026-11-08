@@ -13,6 +13,10 @@
  *   - the app stopped less than MIN_RUN_S after a start with FM, or
  *   - the app already started MAX_FM_STARTS times with FM.
  * SampQOL itself then starts without FM, so a bad fm.so cannot lock you out.
+ * autorun.sh can also turn FM off before (MPCFM_OFF = the short reason).
+ *
+ * Status strip: over SampQOL's splash it writes "mpc-fm <version>  FM on"
+ * or "FM off: <reason>" (strip.c), so you see the result at every start.
  *
  * Built static (musl), so LD_PRELOAD has no effect on this program.
  */
@@ -26,6 +30,9 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+
+#include "strip.h"
+#include "version.h"
 
 #define MIN_RUN_S 600
 #define MAX_FM_STARTS 3
@@ -164,17 +171,29 @@ static int find_real(char *out, size_t cap)
     return 0;
 }
 
-/* NULL: add FM to this start. Otherwise the reason why not. */
-static const char *decide(const char *so, const char *preload)
+/* NULL: add FM to this start. Otherwise the reason why not (for the log),
+ * and *label, a short one for the screen. */
+static const char *decide(const char *so, const char *preload, const char **label)
 {
+    const char *off = getenv("MPCFM_OFF");
+    *label = "not set up";
+    if (off && *off) {
+        *label = off;
+        return "turned off by autorun.sh (see its line above)";
+    }
     if (!so || !*so)
         return "MPCFM_SO is not set";
-    if (strstr(preload, so))
+    if (strstr(preload, so)) {
+        *label = "on";
         return "fm.so is already in LD_PRELOAD";
-    if (access(so, R_OK) != 0)
+    }
+    if (access(so, R_OK) != 0) {
+        *label = "fm.so missing";
         return "fm.so is missing";
+    }
     if (!g_state || !*g_state)
         return "MPCFM_STATE is not set";
+    *label = "crash guard";
     if (state_has("off"))
         return "off until the next boot (see the line that turned it off)";
 
@@ -192,7 +211,23 @@ static const char *decide(const char *so, const char *preload)
     }
     write_num("fm-starts", starts + 1);
     write_num("fm-last", now);
+    *label = "on";
     return NULL;
+}
+
+static void show(const char *label, int on)
+{
+    const char *fb = "/dev/fb0";
+#ifdef MPCFM_TEST
+    const char *t = getenv("MPCFM_TEST_FB");
+    if (!t)
+        return;
+    fb = t;
+#endif
+    char status[96];
+    snprintf(status, sizeof status, on ? "FM %s" : "FM off: %s", label);
+    if (strip_draw(fb, "mpc-fm " MPCFM_VERSION "  ", status, on ? STRIP_RGB_ON : STRIP_RGB_OFF) != 0)
+        logline("status strip not drawn (%s)", fb);
 }
 
 int main(int argc, char **argv)
@@ -211,7 +246,8 @@ int main(int argc, char **argv)
 
     /* Only the start of the stock app by SampQOL gets FM. */
     if (preload && strstr(preload, "mpcqol.so")) {
-        const char *why = decide(so, preload);
+        const char *label;
+        const char *why = decide(so, preload, &label);
         if (!why) {
             char value[2048];
             snprintf(value, sizeof value, "%s %s", preload, so);
@@ -220,6 +256,7 @@ int main(int argc, char **argv)
         } else {
             logline("FM off: %s", why);
         }
+        show(label, !why || strcmp(label, "on") == 0);
     }
 
     execv(real, argv);

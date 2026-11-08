@@ -12,17 +12,21 @@ Install
 -------
 1. MPC Sample firmware 1.3.0 (1.3.0.12), as SampQOL OS needs.
 2. Copy the folder "autorun" of mpc-fm to the root of the SD card.
-3. Download SampQOL OS, unzip it, and copy ITS folder "autorun" into our
-   folder, renamed to "sampqol". Do not change any file in it.
+3. Download SampQOL OS and unzip it. Copy ITS folder "autorun" INTO our
+   "autorun" folder. Do not change any file in it. The name does not
+   matter: "autorun", "sampqol", or the whole unzipped release folder.
 
    SD card
    +-- autorun/              mpc-fm (starts first)
        +-- autorun.json, autorun.check, autorun.sh
        +-- mpcfm/            fm.so, setarch, INSTALL.txt
-       +-- sampqol/          the official SampQOL "autorun" folder, unchanged
+       +-- autorun/          the official SampQOL "autorun" folder, unchanged
        +-- logs/             made at start-up
 
 4. Put the card in the MPC and switch it on. SampQOL OS starts as usual.
+   Under the SampQOL logo, a line shows "mpc-fm 0.0.1  FM on", or
+   "FM off: <reason>" (disabled, files changed, crash guard, ...).
+   No line at all: SampQOL was not found, see logs/mpcfm-launch.log.
 
 Results
 -------
@@ -30,6 +34,15 @@ autorun/logs/mpcfm-status.txt   audio timing, threads, CPU clocks (every 10 s)
 autorun/logs/mpcfm-events.log   start, xruns, late audio blocks
 autorun/logs/mpcfm-launch.log   was FM added to the app, and why not
 With root SSH: /tmp/mpcfm/status.txt is updated every second.
+
+FM engine benchmark (root SSH)
+------------------------------
+fmbench (in the build folder, not on the card) measures the FM engine on
+the MPC's own CPU:
+    ssh ... 'cat > /run/fmbench && chmod +x /run/fmbench' < fmbench
+    ssh ... '/run/fmbench -c 3'
+-c 3 pins it to core 3. Pick a core the audio thread does not use (see the
+"core" column of mpcfm-status.txt) so the music does not drop out.
 
 Turn FM off
 -----------

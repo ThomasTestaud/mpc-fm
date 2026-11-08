@@ -1,9 +1,12 @@
 # mpc-fm build
 #
 #   make toolchain   download the pinned zig (no root needed)
-#   make check       host build + tests (launcher, autorun chain, probe)
+#   make check       host build + tests (engine, launcher, autorun chain, probe)
 #   make arm         aarch64 build for the MPC Sample + static checks
 #   make dist        SD card folder in dist/autorun/
+#   make bench       FM engine benchmark on this computer (the device one is
+#                    build/aarch64/fmbench: copy it to the MPC and run it there)
+#   make wavs        render every preset to build/wav/ to listen to them
 #
 # Cross build: zig cc. It links fm.so against glibc $(GLIBC) symbol
 # versions, so it runs on the device's glibc (>= 2.30, as SampQOL needs).
@@ -21,14 +24,22 @@ CC_HOST ?= cc
 
 CFLAGS = -std=c11 -O2 -Wall -Wextra -Werror -fno-strict-aliasing
 SO_FLAGS = -shared -fPIC -fvisibility=hidden -Wl,--build-id=sha1
+# The engine: -O3 to vectorize the operator loops (NEON), FMA allowed.
+# No -ffast-math: sanitize() relies on NaN checks.
+ENGINE_FLAGS = -O3 -fno-math-errno -ffp-contract=fast -Isrc/fm
 
 FM_SRC = src/fm.c src/alsa_probe.c
 FM_HDR = src/probe.h src/version.h
+ENGINE_SRC = src/fm/fm_engine.c src/fm/fm_presets.c
+ENGINE_HDR = src/fm/fm_engine.h src/fm/fm_presets.h
+SHIM_SRC = launcher/setarch.c launcher/strip.c
+SHIM_HDR = launcher/strip.h launcher/font.h src/version.h
+SHIM_FLAGS = -Isrc -Ilauncher
 
 ARM = build/aarch64
 HOST = build/host
 
-.PHONY: all toolchain arm check host dist clean
+.PHONY: all toolchain arm check host dist bench wavs clean
 all: check arm
 
 toolchain: $(ZIG)
@@ -36,31 +47,35 @@ $(ZIG):
 	sh tools/fetch-toolchain.sh
 
 # ---- device build ----
-arm: $(ARM)/fm.so $(ARM)/setarch
+arm: $(ARM)/fm.so $(ARM)/setarch $(ARM)/fmbench
 	sh tools/verify-arm.sh $(ARM)
 
 $(ARM)/fm.so: $(FM_SRC) $(FM_HDR) | $(ZIG)
 	@mkdir -p $(@D)
 	$(CC_ARM) $(CFLAGS) $(SO_FLAGS) -o $@ $(FM_SRC) -ldl -lpthread
 
-$(ARM)/setarch: launcher/setarch.c | $(ZIG)
+$(ARM)/setarch: $(SHIM_SRC) $(SHIM_HDR) | $(ZIG)
 	@mkdir -p $(@D)
-	$(CC_ARM_STATIC) $(CFLAGS) -o $@ $<
+	$(CC_ARM_STATIC) $(CFLAGS) $(SHIM_FLAGS) -o $@ $(SHIM_SRC)
+
+$(ARM)/fmbench: tools/fmbench.c $(ENGINE_SRC) $(ENGINE_HDR) | $(ZIG)
+	@mkdir -p $(@D)
+	$(CC_ARM_STATIC) $(CFLAGS) $(ENGINE_FLAGS) -o $@ tools/fmbench.c $(ENGINE_SRC) -lm
 
 dist: arm
 	sh tools/mkdist.sh $(ARM) dist
 
 # ---- host build and tests ----
-host: $(HOST)/fm.so $(HOST)/setarch $(HOST)/fake_app
+host: $(HOST)/fm.so $(HOST)/setarch $(HOST)/fake_app $(HOST)/test_fm $(HOST)/fmbench $(HOST)/fmrender
 
 $(HOST)/fm.so: $(FM_SRC) $(FM_HDR)
 	@mkdir -p $(@D)
 	$(CC_HOST) $(CFLAGS) $(SO_FLAGS) -DMPCFM_TARGET_EXE='"$(abspath $(HOST)/fake_app)"' \
 		-o $@ $(FM_SRC) -ldl -lpthread
 
-$(HOST)/setarch: launcher/setarch.c
+$(HOST)/setarch: $(SHIM_SRC) $(SHIM_HDR)
 	@mkdir -p $(@D)
-	$(CC_HOST) $(CFLAGS) -DMPCFM_TEST -o $@ $<
+	$(CC_HOST) $(CFLAGS) $(SHIM_FLAGS) -DMPCFM_TEST -o $@ $(SHIM_SRC)
 
 $(HOST)/libfakeasound.so: tests/fake_asound.c
 	@mkdir -p $(@D)
@@ -69,10 +84,30 @@ $(HOST)/libfakeasound.so: tests/fake_asound.c
 $(HOST)/fake_app: tests/fake_app.c $(HOST)/libfakeasound.so
 	$(CC_HOST) $(CFLAGS) -o $@ $< -L$(HOST) -lfakeasound -Wl,-rpath,'$$ORIGIN'
 
+$(HOST)/test_fm: tests/test_fm.c $(ENGINE_SRC) $(ENGINE_HDR)
+	@mkdir -p $(@D)
+	$(CC_HOST) $(CFLAGS) -D_GNU_SOURCE $(ENGINE_FLAGS) -o $@ tests/test_fm.c $(ENGINE_SRC) -lm
+
+$(HOST)/fmbench: tools/fmbench.c $(ENGINE_SRC) $(ENGINE_HDR)
+	@mkdir -p $(@D)
+	$(CC_HOST) $(CFLAGS) $(ENGINE_FLAGS) -o $@ tools/fmbench.c $(ENGINE_SRC) -lm
+
+$(HOST)/fmrender: tools/fmrender.c $(ENGINE_SRC) $(ENGINE_HDR)
+	@mkdir -p $(@D)
+	$(CC_HOST) $(CFLAGS) $(ENGINE_FLAGS) -o $@ tools/fmrender.c $(ENGINE_SRC) -lm
+
 check: host
+	$(HOST)/test_fm
 	sh tests/test_launcher.sh $(HOST)/setarch
 	sh tests/test_autorun.sh $(HOST)
 	sh tests/test_probe.sh $(HOST)
+
+bench: $(HOST)/fmbench
+	$(HOST)/fmbench -q
+
+wavs: $(HOST)/fmrender
+	@mkdir -p build/wav
+	$(HOST)/fmrender all build/wav
 
 clean:
 	rm -rf build dist

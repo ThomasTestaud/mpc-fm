@@ -40,6 +40,31 @@ expect "fm.so already there: not twice" "$(run "$S" 100 "$FM")" "PRELOAD=[$FM] $
 check "no state written for those" test ! -e "$S/fm-starts"
 
 S="$T/boot4"
+expect "MPCFM_OFF from autorun.sh: FM off" "$(MPCFM_OFF="disabled" run "$S" 100 "$Q")" "PRELOAD=[$Q] $ARGS"
+check "launch.log says autorun.sh turned it off" grep -q "turned off by autorun.sh" "$S/launch.log"
+
+# Status strip, drawn into a fake 320x240 XRGB framebuffer.
+FB="$T/fb.raw"
+strip_case() { # name state uptime -> fills $FB
+    head -c 307200 /dev/zero > "$FB"
+    MPCFM_TEST_FB="$FB" run "$2" "$3" "$Q" >/dev/null
+}
+band_lit() { # count lit pixels of a color in rows y0..y1 (python-free: od)
+    od -An -v -tx4 -w4 -j $(($1 * 1280)) -N $((($2 - $1 + 1) * 1280)) "$FB" | grep -c "$3"
+}
+strip_case "on" "$T/boot5" 100
+check "strip: rest of the screen untouched" test "$(head -c 268800 "$FB" | tr -d '\000' | wc -c)" -eq 0
+on_green=$(band_lit 210 230 003ccf6e)
+on_grey=$(band_lit 210 230 008c8c8c)
+check "strip FM on: green status ($on_green px), grey text ($on_grey px)" test "$on_green" -gt 50 -a "$on_grey" -gt 100
+cp "$FB" "$T/strip-on.raw"
+strip_case "off" "$T/boot5" 200
+off_amber=$(band_lit 210 230 00f5a623)
+check "strip after a quick restart: amber 'FM off: crash guard' ($off_amber px)" test "$off_amber" -gt 100
+check "strip off: no green left" test "$(band_lit 210 230 003ccf6e)" -eq 0
+[ -n "${STRIP_OUT:-}" ] && cp "$T/strip-on.raw" "$STRIP_OUT-on.raw" && cp "$FB" "$STRIP_OUT-off.raw"
+
+S="$T/boot6"
 rm "$T/fm.so"
 expect "fm.so missing: unchanged" "$(run "$S" 100 "$Q")" "PRELOAD=[$Q] $ARGS"
 finish
