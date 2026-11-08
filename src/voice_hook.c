@@ -14,10 +14,15 @@
  *   gen+240         Sample object (its frames: found by discover.c)
  *   gen+368         read position, 32.32 fixed point
  * In 0x2216f70, out = interpolated sample x gain ramp; the voice does the
- * rest. So for an FM carrier we run the stock render (its position, loops,
- * end and ramp state stay stock), then overwrite buf with the FM engine x
- * the same gain ramp. The pitch is how far the stock position moved in
- * this block (tune, Keys mode, pitch envelope: all included).
+ * rest. So for an FM carrier we run the stock render (its loops, end and
+ * ramp state stay stock), then overwrite buf with the FM engine x the same
+ * gain ramp. The pitch is how far the stock position moved in this block
+ * (tune, Keys mode, pitch envelope: all included). Then we set the
+ * position to advance one frame per frame: a synth note does not get
+ * shorter when it plays higher (v0.1.1 let the stock speed run).
+ * Guards: a non-finite stock gain, or an FM output that is not finite or
+ * absurdly loud, gives the block back to stock and drops the FM voice, so
+ * a bad value never reaches the mix.
  *
  * The vtable is checked first; if anything differs, nothing is changed.
  * Audio path: no locks, no allocation; at note start only, a few
@@ -54,6 +59,11 @@
 #define SLOTS 64
 #define SR 44100.0f
 #define CHUNK 128
+#define MAX_ABS 8.0f /* FM output above this is a bug: give back to stock */
+
+/* Reader fields of the generator itself (from start: +0x168 .. +0x3b0). */
+#define READER_LO 0x168
+#define READER_HI 0x3b0
 
 typedef struct {
     const char *build_id;
@@ -83,6 +93,22 @@ vh_stats_t vh_stats;
 
 static inline float f32(void *o, int off) { float v; memcpy(&v, (char *)o + off, 4); return v; }
 static inline uint64_t u64(void *o, int off) { uint64_t v; memcpy(&v, (char *)o + off, 8); return v; }
+static inline void set_u64(void *o, int off, uint64_t v) { memcpy((char *)o + off, &v, 8); }
+
+/* For the crash report: 1 while in our hook code, 2 while in the stock
+ * method called from our hook. */
+__thread int vh_in_hook __attribute__((tls_model("initial-exec")));
+
+/* A discovered path must stay tied to the pad played: through its sample
+ * object (+240, up to 5 hops) or its own reader fields (up to 2 hops). */
+static int first_hop(int off)
+{
+    if (off == OFF_SAMPLE)
+        return 5;
+    if (off >= READER_LO && off < READER_HI)
+        return 2;
+    return 0;
+}
 
 static inline uint64_t now_ns(void)
 {
@@ -142,19 +168,31 @@ static void claim(void *gen)
 static uintptr_t w_start(void *gen, uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4,
                          uintptr_t a5, uintptr_t a6, uintptr_t a7)
 {
+    vh_in_hook = 2;
     uintptr_t r = g_start(gen, a1, a2, a3, a4, a5, a6, a7); /* stock first: its args untouched */
+    vh_in_hook = 1;
     atomic_fetch_add_explicit(&vh_stats.starts, 1, memory_order_relaxed);
     slot_release(gen); /* a reused generator: forget its old note */
     claim(gen);
+    vh_in_hook = 0;
     return r;
 }
 
 static uintptr_t w_stop(void *gen, uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4,
                         uintptr_t a5, uintptr_t a6, uintptr_t a7)
 {
+    vh_in_hook = 2;
     uintptr_t r = g_stop(gen, a1, a2, a3, a4, a5, a6, a7);
+    vh_in_hook = 1;
     slot_release(gen);
+    vh_in_hook = 0;
     return r;
+}
+
+static void drop(void *gen, _Atomic uint64_t *counter)
+{
+    atomic_fetch_add_explicit(counter, 1, memory_order_relaxed);
+    slot_release(gen);
 }
 
 static uintptr_t w_render(void *gen, uintptr_t a_buf, uintptr_t a_n, uintptr_t a3, uintptr_t a4,
@@ -163,10 +201,13 @@ static uintptr_t w_render(void *gen, uintptr_t a_buf, uintptr_t a_n, uintptr_t a
     slot_t *s = slot_find(gen);
     if (!s)
         return g_render(gen, a_buf, a_n, a3, a4, a5, a6, a7);
+    vh_in_hook = 1;
     if (u64(gen, OFF_RENDER_FN) != g_plain_mono) { /* stereo or time-stretch: stock */
-        atomic_fetch_add_explicit(&vh_stats.unsupported, 1, memory_order_relaxed);
-        slot_release(gen);
-        return g_render(gen, a_buf, a_n, a3, a4, a5, a6, a7);
+        drop(gen, &vh_stats.unsupported);
+        vh_in_hook = 2;
+        uintptr_t r = g_render(gen, a_buf, a_n, a3, a4, a5, a6, a7);
+        vh_in_hook = 0;
+        return r;
     }
     float *buf = (float *)a_buf;
     int n = (int)a_n;
@@ -175,10 +216,19 @@ static uintptr_t w_render(void *gen, uintptr_t a_buf, uintptr_t a_n, uintptr_t a
     float g = f32(gen, OFF_GAIN), target = f32(gen, OFF_GAIN + 4), step = f32(gen, OFF_GAIN + 8);
     uint64_t pos0 = u64(gen, OFF_POS);
 
+    vh_in_hook = 2;
     uintptr_t r = g_render(gen, a_buf, a_n, a3, a4, a5, a6, a7);
+    vh_in_hook = 1;
 
     int d = delay < 0 ? 0 : delay > n ? n : delay; /* the stock wrote zeros there */
     int m = n - d;
+    int sane = isfinite(g) && isfinite(target) && isfinite(step) && fabsf(g) < 16.0f &&
+               fabsf(target) < 16.0f && n > 0 && n <= 65536;
+    if (!sane) {
+        drop(gen, &vh_stats.bad_input); /* keep the stock output */
+        vh_in_hook = 0;
+        return r;
+    }
     if (m > 0 && buf) {
         uint64_t t0 = now_ns();
         uint64_t pos1 = u64(gen, OFF_POS);
@@ -189,11 +239,17 @@ static uintptr_t w_render(void *gen, uintptr_t a_buf, uintptr_t a_n, uintptr_t a
         }
         float hz = (float)((double)s->root_hz * s->ratio);
         float y[CHUNK];
+        int bad = 0;
         uint32_t gb, tb;
         memcpy(&tb, &target, 4);
-        for (int done = 0; done < m;) {
+        for (int done = 0; done < m && !bad;) {
             int len = m - done < CHUNK ? m - done : CHUNK;
             fm_voice_render(&s->voice, &s->patch, hz, y, len);
+            for (int k = 0; k < len; k++)
+                if (!(fabsf(y[k]) < MAX_ABS)) /* NaN fails this too */
+                    bad = 1;
+            if (bad)
+                break;
             float *out = buf + d + done;
             for (int k = 0; k < len; k++) {
                 memcpy(&gb, &g, 4);
@@ -205,6 +261,17 @@ static uintptr_t w_render(void *gen, uintptr_t a_buf, uintptr_t a_n, uintptr_t a
             }
             done += len;
         }
+        if (bad) {
+            /* Rare and a bug: this block may be half FM; make it silent
+             * rather than wrong, and give the layer back to stock. */
+            memset(buf + d, 0, (size_t)m * sizeof(float));
+            drop(gen, &vh_stats.bad_output);
+            vh_in_hook = 0;
+            return r;
+        }
+        /* One frame per frame from now on, whatever the pitch. */
+        if (r & 0xff)
+            set_u64(gen, OFF_POS, pos0 + ((uint64_t)m << 32));
         uint64_t dt = now_ns() - t0;
         atomic_fetch_add_explicit(&vh_stats.fm_ns, dt, memory_order_relaxed);
         atomic_fetch_add_explicit(&vh_stats.fm_blocks, 1, memory_order_relaxed);
@@ -215,6 +282,7 @@ static uintptr_t w_render(void *gen, uintptr_t a_buf, uintptr_t a_n, uintptr_t a
     }
     if (!(r & 0xff))
         slot_release(gen); /* the stock layer has ended */
+    vh_in_hook = 0;
     return r;
 }
 
@@ -253,6 +321,7 @@ int vh_install(uintptr_t base, const char *build_id, char *msg, size_t cap)
     g_plain_mono = base + L->plain_mono;
     g_image_lo = base;
     g_image_hi = base + L->image_size;
+    disc_set_first_hop(first_hop);
     __atomic_store_n(&vt[SLOT_RENDER], (uintptr_t)w_render, __ATOMIC_RELEASE);
     __atomic_store_n(&vt[SLOT_STOP], (uintptr_t)w_stop, __ATOMIC_RELEASE);
     __atomic_store_n(&vt[SLOT_START], (uintptr_t)w_start, __ATOMIC_RELEASE);
@@ -274,6 +343,7 @@ void vh_test_setup(vh_fn start, vh_fn stop, vh_fn render, uintptr_t plain_mono)
     g_render = render;
     g_plain_mono = plain_mono;
     g_image_lo = g_image_hi = 0;
+    disc_set_first_hop(first_hop);
     memset(g_slots, 0, sizeof g_slots);
     memset(&vh_stats, 0, sizeof vh_stats);
 }

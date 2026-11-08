@@ -129,6 +129,86 @@ static void logline(const char *fmt, ...)
     }
 }
 
+/* After a crash the app restarts through here: keep what explains it.
+ * SampQOL's crash log is in RAM (/tmp), the kernel's line in /dev/kmsg. */
+static void copy_file_tail(const char *src, const char *dst_name, const char *title)
+{
+    char buf[16384];
+    int fd = open(src, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return;
+    off_t size = lseek(fd, 0, SEEK_END);
+    off_t from = size > (off_t)sizeof buf ? size - (off_t)sizeof buf : 0;
+    ssize_t n = pread(fd, buf, sizeof buf, from);
+    close(fd);
+    if (n <= 0 || !g_logdir || !*g_logdir)
+        return;
+    char p[512];
+    snprintf(p, sizeof p, "%s/%s", g_logdir, dst_name);
+    int out = open(p, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (out < 0)
+        return;
+    char head[200];
+    int hn = snprintf(head, sizeof head, "\n===== %s (up %ld s) =====\n", title, uptime_s());
+    if (write(out, head, (size_t)hn) < 0 || write(out, buf, (size_t)n) < 0) {
+        /* best effort */
+    }
+    close(out);
+}
+
+static void copy_kernel_crash_lines(void)
+{
+#ifdef MPCFM_TEST
+    const char *kmsg = getenv("MPCFM_TEST_KMSG") ? getenv("MPCFM_TEST_KMSG") : "/nonexistent";
+#else
+    const char *kmsg = "/dev/kmsg";
+#endif
+    int fd = open(kmsg, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0 || !g_logdir || !*g_logdir) {
+        if (fd >= 0)
+            close(fd);
+        return;
+    }
+    static char keep[40][300];
+    int nkeep = 0, total = 0;
+    char rec[2048];
+    for (;;) { /* one record per read, EAGAIN at the end */
+        ssize_t n = read(fd, rec, sizeof rec - 1);
+        if (n <= 0)
+            break;
+        rec[n] = 0;
+        char *msg = strchr(rec, ';');
+        msg = msg ? msg + 1 : rec;
+        if (strstr(msg, "MPC Sample") || strstr(msg, "segfault") || strstr(msg, "unhandled") ||
+            strstr(msg, "Unable to handle") || strstr(msg, " pc ") || strstr(msg, "Call trace")) {
+            size_t ml = strlen(msg) < sizeof keep[0] - 1 ? strlen(msg) : sizeof keep[0] - 1;
+            memcpy(keep[nkeep % 40], msg, ml);
+            keep[nkeep % 40][ml] = 0;
+            nkeep++;
+        }
+        total++;
+    }
+    close(fd);
+    char p[512];
+    snprintf(p, sizeof p, "%s/mpcfm-kernel.log", g_logdir);
+    int out = open(p, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (out < 0)
+        return;
+    char head[160];
+    int hn = snprintf(head, sizeof head, "\n===== kernel messages about the app (up %ld s, %d of %d) =====\n",
+                      uptime_s(), nkeep < 40 ? nkeep : 40, total);
+    if (write(out, head, (size_t)hn) < 0) {
+        /* best effort */
+    }
+    for (int i = nkeep > 40 ? nkeep - 40 : 0; i < nkeep; i++) {
+        const char *l = keep[i % 40];
+        size_t len = strlen(l);
+        if (write(out, l, len) < 0 || (len && l[len - 1] != '\n' && write(out, "\n", 1) < 0))
+            break;
+    }
+    close(out);
+}
+
 static int same_file(const char *a, const char *b)
 {
     struct stat x, y;
@@ -352,6 +432,21 @@ int main(int argc, char **argv)
 
     /* Only the start of the stock app by SampQOL gets FM. */
     if (preload && strstr(preload, "mpcqol.so")) {
+        long launches = g_state && *g_state ? read_num("launches") : -1;
+        if (launches < 0)
+            launches = 0;
+        if (g_state && *g_state)
+            write_num("launches", launches + 1);
+        if (launches > 0) { /* a restart: the app stopped, maybe crashed */
+#ifdef MPCFM_TEST
+            const char *qc = getenv("MPCFM_TEST_QOLCRASH") ? getenv("MPCFM_TEST_QOLCRASH") : "/nonexistent";
+#else
+            const char *qc = "/tmp/mpcqol-crash.txt";
+#endif
+            copy_file_tail(qc, "mpcqol-crash-copy.txt", "SampQOL crash log (from RAM)");
+            copy_kernel_crash_lines();
+            logline("app restart %ld: crash logs copied (if any)", launches);
+        }
         const char *label;
         const char *why = decide(so, preload, &label);
         if (!why) {

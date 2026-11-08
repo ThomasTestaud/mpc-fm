@@ -19,6 +19,15 @@
 
 static disc_path_t g_paths[MAX_PATHS];
 static _Atomic int g_npaths;
+static disc_first_hop_fn g_first_hop;
+
+void disc_set_first_hop(disc_first_hop_fn fn) { g_first_hop = fn; }
+
+/* Max hops for a path whose first hop is at `off` (0: forbidden). */
+static int first_hop_limit(int off)
+{
+    return g_first_hop ? g_first_hop(off) : MAX_DEPTH;
+}
 
 /* SPSC queue: audio thread -> logger. */
 static void *g_queue[QUEUE];
@@ -84,6 +93,7 @@ int disc_lookup(void *gen, fm_patch *p, int *root)
 typedef struct {
     uintptr_t addr;
     int parent, off, depth;
+    int limit; /* max depth allowed on this branch (from its first hop) */
 } node_t;
 
 static node_t g_nodes[MAX_NODES];
@@ -136,7 +146,7 @@ int disc_search(void *gen, uintptr_t image_lo, uintptr_t image_hi, disc_path_t *
     memset(g_seen, 0, sizeof g_seen);
     int n = 0, head = 0;
     *reads = 0;
-    g_nodes[n++] = (node_t){(uintptr_t)gen, -1, 0, 0};
+    g_nodes[n++] = (node_t){(uintptr_t)gen, -1, 0, 0, MAX_DEPTH};
     seen((uintptr_t)gen);
     static unsigned char buf[NODE_BYTES + SCAN_OFFSETS + FM_CARRIER_FRAMES * 4];
     while (head < n) {
@@ -171,7 +181,7 @@ int disc_search(void *gen, uintptr_t image_lo, uintptr_t image_hi, disc_path_t *
                     return 1;
                 }
         }
-        if (nd.depth >= MAX_DEPTH)
+        if (nd.depth >= MAX_DEPTH || nd.depth >= nd.limit)
             continue;
         /* Follow its pointers. */
         if (!have_all) {
@@ -183,9 +193,15 @@ int disc_search(void *gen, uintptr_t image_lo, uintptr_t image_hi, disc_path_t *
         for (int o = 0; o + 8 <= (int)span && n < MAX_NODES; o += 8) {
             uintptr_t v;
             memcpy(&v, buf + o, 8);
+            int limit = nd.limit;
+            if (nd.depth == 0) { /* first hop: only fields tied to this pad */
+                limit = first_hop_limit(o);
+                if (limit <= 0)
+                    continue;
+            }
             if (!plausible(v, image_lo, image_hi) || seen(v))
                 continue;
-            g_nodes[n++] = (node_t){v, me, o, nd.depth + 1};
+            g_nodes[n++] = (node_t){v, me, o, nd.depth + 1, limit};
         }
     }
     return 0;

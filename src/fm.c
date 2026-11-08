@@ -35,6 +35,7 @@
 
 #include "probe.h"
 #include "version.h"
+#include "crash.h"
 #include "discover.h"
 #include "voice_hook.h"
 
@@ -444,11 +445,14 @@ static void status_fm(sbuf *b)
     g_prev_ns = ns;
     sb_printf(b,
               "layer starts %llu, FM notes %llu, FM voices now %d, no free FM voice %llu,"
-              " FM file on a stereo/stretch layer %llu\n",
+              " FM file on a stereo/stretch layer %llu, dropped: bad stock gain %llu,"
+              " bad FM output %llu\n",
               (unsigned long long)atomic_load(&vh_stats.starts),
               (unsigned long long)atomic_load(&vh_stats.fm_starts), atomic_load(&vh_stats.active),
               (unsigned long long)atomic_load(&vh_stats.no_slot),
-              (unsigned long long)atomic_load(&vh_stats.unsupported));
+              (unsigned long long)atomic_load(&vh_stats.unsupported),
+              (unsigned long long)atomic_load(&vh_stats.bad_input),
+              (unsigned long long)atomic_load(&vh_stats.bad_output));
     sb_printf(b,
               "FM render: %llu calls in the last 1 s, avg %.1f us per call, max %.1f us since start;"
               " last pitch ratio %.3f (root note %d); carrier check max %.1f us\n",
@@ -529,6 +533,12 @@ static void *logger_main(void *arg)
             write_atomic(g_logdir, "mpcfm-status.txt", buf, b.len);
         if (g_logdir[0] && (tick == 20 || tick % 60 == 0))
             copy_qol_log();
+        if (tick == 5) { /* after SampQOL has put its own crash handler */
+            char path[300], m[200];
+            snprintf(path, sizeof path, "%s/%s", g_logdir[0] ? g_logdir : g_tmpdir, "mpcfm-crash.log");
+            crash_install(path, g_app_base, m, sizeof m);
+            event("%s", m);
+        }
         if (g_hooks_on) {
             char m[256];
             if (vh_poll(m, sizeof m)) {

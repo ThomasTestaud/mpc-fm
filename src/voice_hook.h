@@ -21,6 +21,8 @@ typedef struct {
     _Atomic uint64_t fm_starts;     /* of these, FM carriers */
     _Atomic uint64_t no_slot;       /* FM carrier but all FM voices busy */
     _Atomic uint64_t unsupported;   /* FM carrier on a stereo / time-stretch layer */
+    _Atomic uint64_t bad_input;     /* stock gain not finite: dropped to stock */
+    _Atomic uint64_t bad_output;    /* FM output not finite / too loud: dropped */
     _Atomic uint64_t fm_blocks;     /* render calls with FM */
     _Atomic uint64_t fm_ns;         /* time in the FM engine */
     _Atomic uint64_t fm_max_ns;     /* longest FM render of one call */
@@ -31,6 +33,10 @@ typedef struct {
 } vh_stats_t;
 
 extern vh_stats_t vh_stats;
+
+/* 1 while the thread runs our hook code, 2 while it runs the stock method
+ * called from our hook, else 0 (for crash reports). */
+extern __thread int vh_in_hook __attribute__((tls_model("initial-exec")));
 
 typedef uintptr_t (*vh_fn)(void *, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t,
                            uintptr_t, uintptr_t);

@@ -38,6 +38,13 @@ int disc_poll(uintptr_t image_lo, uintptr_t image_hi, int key_off, char *msg, si
 int disc_paths(disc_path_t *out, int max);
 void disc_describe(const disc_path_t *d, char *out, size_t cap);
 
+/* Which first hops from the generator may start a path, and how many hops
+ * such a path may have (0: not allowed). A path must stay tied to the pad
+ * being played: through its own sample object or its own reader fields,
+ * never through shared objects (a v0.1.1 crash followed such a path). */
+typedef int (*disc_first_hop_fn)(int off);
+void disc_set_first_hop(disc_first_hop_fn fn);
+
 /* Safe memory read (process_vm_readv). 0 on success. */
 int disc_read(void *dst, uintptr_t addr, size_t n);
 
