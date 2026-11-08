@@ -35,6 +35,7 @@
 
 #include "probe.h"
 #include "version.h"
+#include "discover.h"
 #include "voice_hook.h"
 
 #ifndef MPCFM_TARGET_EXE
@@ -442,24 +443,28 @@ static void status_fm(sbuf *b)
     g_prev_blocks = blocks;
     g_prev_ns = ns;
     sb_printf(b,
-              "sample starts %llu, FM notes %llu, FM voices now %d, damaged headers %llu,"
-              " no free FM voice %llu\n",
+              "layer starts %llu, FM notes %llu, FM voices now %d, no free FM voice %llu,"
+              " FM file on a stereo/stretch layer %llu\n",
               (unsigned long long)atomic_load(&vh_stats.starts),
               (unsigned long long)atomic_load(&vh_stats.fm_starts), atomic_load(&vh_stats.active),
-              (unsigned long long)atomic_load(&vh_stats.bad_headers),
-              (unsigned long long)atomic_load(&vh_stats.no_slot));
+              (unsigned long long)atomic_load(&vh_stats.no_slot),
+              (unsigned long long)atomic_load(&vh_stats.unsupported));
     sb_printf(b,
               "FM render: %llu calls in the last 1 s, avg %.1f us per call, max %.1f us since start;"
-              " last pitch ratio %.3f (root note %d)\n",
+              " last pitch ratio %.3f (root note %d); carrier check max %.1f us\n",
               (unsigned long long)db, db ? (double)dn / (double)db / 1e3 : 0.0,
               (double)atomic_load(&vh_stats.fm_max_ns) / 1e3,
-              atomic_load(&vh_stats.last_ratio_milli) / 1000.0, atomic_load(&vh_stats.last_root));
-    sb_printf(b, "last sample started, first frames x32768:");
-    for (int i = 0; i < 8; i++) {
-        int v = atomic_load(&vh_stats.last_first[i]);
-        sb_printf(b, " %d(%d)", v, v & 15);
+              atomic_load(&vh_stats.last_ratio_milli) / 1000.0, atomic_load(&vh_stats.last_root),
+              (double)atomic_load(&vh_stats.lookup_max_ns) / 1e3);
+    disc_path_t paths[4];
+    int n = disc_paths(paths, 4);
+    if (!n)
+        sb_printf(b, "carrier frames: not found yet (play a pad with an FM-*.wav file once)\n");
+    for (int i = 0; i < n; i++) {
+        char d[160];
+        disc_describe(&paths[i], d, sizeof d);
+        sb_printf(b, "carrier frames path %d: %s\n", i, d);
     }
-    sb_printf(b, "\n  (value(low nibble); an FM carrier's nibbles are 13 4 0 5 6 4 13 4)\n");
 }
 
 /* SampQOL's own log, copied to the card: to see if both mods get along. */
@@ -479,7 +484,7 @@ static void copy_qol_log(void)
 
 static void build_status(sbuf *b, long up_s)
 {
-    sb_printf(b, "mpc-fm %s (FM pads: phase 1 prototype)  pid %d  up %ld s\n",
+    sb_printf(b, "mpc-fm %s (FM pads: prototype)  pid %d  up %ld s\n",
               MPCFM_VERSION, getpid(), up_s);
     const char *fw = known_firmware();
     sb_printf(b, "app build-id %s (%s%s)  SampQOL loaded: %s\n", g_buildid,
@@ -524,6 +529,14 @@ static void *logger_main(void *arg)
             write_atomic(g_logdir, "mpcfm-status.txt", buf, b.len);
         if (g_logdir[0] && (tick == 20 || tick % 60 == 0))
             copy_qol_log();
+        if (g_hooks_on) {
+            char m[256];
+            if (vh_poll(m, sizeof m)) {
+                event("%s", m);
+                if (g_logdir[0]) /* show it on the card at once */
+                    write_atomic(g_logdir, "mpcfm-status.txt", buf, b.len);
+            }
+        }
     }
     return NULL;
 }

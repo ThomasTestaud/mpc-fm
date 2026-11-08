@@ -34,4 +34,10 @@ int fm_carrier_decode(const float *frames, int count, fm_patch *p, int *root_not
 /* Quick test of the first frames only (the magic). */
 int fm_carrier_has_magic(const float *frames, int count);
 
+/* The same for frames in other in-memory formats. */
+enum { FM_FMT_F32 = 0, FM_FMT_I16 = 1, FM_FMT_I32 = 2, FM_FMT_COUNT = 3 };
+int fm_carrier_frame_bytes(int fmt);
+int fm_carrier_has_magic_fmt(const void *frames, int fmt, int count);
+int fm_carrier_decode_fmt(const void *frames, int fmt, int count, fm_patch *p, int *root_note);
+
 #endif

@@ -9,21 +9,28 @@ Plan: FM as a pad's sound source. A pad plays an FM patch instead of a
 sample, and everything after the sound source stays stock: filter, envelopes,
 Pad EQ, inserts, mixer, 16 Levels, Keys, export and resample.
 
-**Status: 0.1.0, first FM pads prototype (not yet tested on the device).**
+**Status: 0.1.1, FM pads prototype.** 0.1.0 ran on the device without a
+problem but never played FM: it hooked a voice class the drum pads do not use.
+0.1.1 hooks the right one (not yet tested on the device).
 
 - **FM carriers.** `make samples` writes WAV files that are recordings of FM
   patches with the patch hidden in the lowest 4 bits of the first 336 frames
   (at most 15 LSB, -66 dB, CRC-checked; `src/fm/fm_carrier.c`). On a stock
   MPC they play as recordings. With mpc-fm, a pad with such a file plays the
   live FM engine; the patch travels with the sample into projects.
-- **Voice hook** (`src/voice_hook.c`). Three vtable entries of the stock
-  sample voice (`Qbq::SamplerVoiceMemoryMode`: start, stop, process) are
-  swapped, after a check that the vtable is exactly stock for app build
-  `1dac7f48` (fw 1.3.0.12). For a carrier, the stock reader runs with its
-  gains at 0 (so position, loops, end of sample and fades stay stock) and
-  the FM output is added with the stock gains and fade, at the stock pitch
-  increment. Everything after the sound source is stock: filter, envelopes,
-  Pad EQ, inserts, mixer, 16 Levels, Keys, export.
+- **Voice hook** (`src/voice_hook.c`). The drum voice renders each layer
+  through a `DefaultSampleGenerator`; three of its vtable entries (start,
+  stop, render) are swapped, after a check that all 16 are exactly stock for
+  app build `1dac7f48` (fw 1.3.0.12). For a carrier, the stock render runs
+  (position, loops, end, gain ramp stay stock), then its output is replaced
+  by the FM engine x the same gain ramp; pitch = how far the stock read
+  position moved. Everything after the source is stock: filter, amp
+  envelope, pan, Pad EQ, inserts, mixer, 16 Levels, Keys, export.
+- **Discovery** (`src/discover.c`). Where the app keeps a sample's frames
+  is found at run time: the low-priority thread searches memory reachable
+  from the generator for a carrier header with `process_vm_readv` (a bad
+  pointer cannot crash), staying inside each heap block. The path it learns
+  is then followed at each note start (a few reads).
 - **FM engine** (`src/fm/`): 4 operators, 8 algorithms, an envelope per
   operator, feedback on operator 4. No allocation, no locks; output
   bit-exact whatever the render block sizes.
@@ -80,7 +87,8 @@ CPU tuning: `-mcpu=cortex_a55` (Rockchip RK3566).
 | `src/fm.c` | entry point, status/log thread |
 | `src/alsa_probe.c` | timing wrappers of the ALSA PCM calls |
 | `src/fm/` | FM engine, presets, carrier header |
-| `src/voice_hook.c` | FM as the sound source of a pad (stock voice hooks) |
+| `src/voice_hook.c` | FM as the sound source of a pad (stock generator hooks) |
+| `src/discover.c` | run-time search for the sample frames |
 | `launcher/` | `autorun.sh` template, `autorun.json`, `setarch` stand-in, status strip |
 | `tools/` | toolchain fetch, `autorun.check`, SD folder, aarch64 checks, `fmbench`, `fmrender`, font generator |
 | `tests/` | engine unit tests; launcher tests with a fake ALSA library, fake app and fake framebuffer |

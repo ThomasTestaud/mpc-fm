@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
-/* Host tests of the voice hook wrappers, with a fake sample voice object
- * that has the stock layout and fake stock methods. */
+/* Host tests of the generator hook and of discovery, with a fake
+ * DefaultSampleGenerator that has the stock field layout, fake stock
+ * methods, and a fake Sample -> provider -> holder -> frames chain. */
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -8,6 +9,7 @@
 #include <string.h>
 #include <sys/mman.h>
 
+#include "discover.h"
 #include "fm/fm_carrier.h"
 #include "fm/fm_engine.h"
 #include "fm/fm_presets.h"
@@ -16,59 +18,99 @@
 static int fails;
 #define CHECK(c, ...) do { printf((c) ? "ok   " : "FAIL "); if (!(c)) fails++; printf(__VA_ARGS__); printf("\n"); } while (0)
 
-#define N 128
+#define N 64
 #define FRAMES 44100
-static float sample[FRAMES];
+#define PLAIN 0x2216f70u   /* stands for the plain mono render function */
 
-/* fake object with the stock field offsets */
-typedef struct { unsigned char b[0xc0]; long pos; } obj_t;
-static void setf(obj_t *o, int off, float v) { memcpy(o->b + off, &v, 4); }
-static float getf(obj_t *o, int off) { float v; memcpy(&v, o->b + off, 4); return v; }
-static void setd(obj_t *o, int off, double v) { memcpy(o->b + off, &v, 8); }
+typedef struct { unsigned char b[0x400]; } gen_t;
+static void setf(gen_t *g, int off, float v) { memcpy(g->b + off, &v, 4); }
+static float getf(gen_t *g, int off) { float v; memcpy(&v, g->b + off, 4); return v; }
+static void setu64(gen_t *g, int off, uint64_t v) { memcpy(g->b + off, &v, 8); }
+static uint64_t getu64(gen_t *g, int off) { uint64_t v; memcpy(&v, g->b + off, 8); return v; }
+static void seti(gen_t *g, int off, int v) { memcpy(g->b + off, &v, 4); }
 
-static int stock_calls;
-static float stock_gains_seen[2];
-/* fake stock process: out += gain * sample, 1 frame per frame, 0 at the end */
-static uintptr_t fake_process(void *self, uintptr_t a_out, uintptr_t a_start, uintptr_t a_n)
+/* the fake sample chain: gen+240 -> sample; sample+368 -> provider;
+ * provider+40 -> holder; holder+0 -> frames */
+static float frames_f[FRAMES];
+static int16_t frames_i[FRAMES];
+static void *sample, *provider, *holder;
+static double g_ratio = 1.0; /* what the fake stock render advances per frame */
+static const float *g_src = frames_f;
+
+static void build_chain(void *data)
 {
-    obj_t *o = self;
-    float **out = (float **)a_out;
-    float gl = getf(o, 72), gr = getf(o, 76);
-    stock_gains_seen[0] = gl;
-    stock_gains_seen[1] = gr;
-    stock_calls++;
-    int end; memcpy(&end, o->b + 0x88, 4);
-    for (int k = 0; k < (int)a_n; k++) {
-        if (o->pos >= end) return 0;
-        float v = sample[o->pos++];
-        out[0][a_start + k] += gl * v;
-        out[1][a_start + k] += gr * v;
-    }
-    return o->pos < end;
+    sample = calloc(1, 0x400);
+    provider = calloc(1, 0x100);
+    holder = calloc(1, 0x40);
+    memcpy((char *)sample + 368, &provider, 8);
+    memcpy((char *)provider + 40, &holder, 8);
+    memcpy(holder, &data, 8);
 }
-static uintptr_t fake_start(void *self, uintptr_t a1, uintptr_t a2, uintptr_t a3)
+
+static void make_frames(int carrier, const char *preset, int root)
 {
-    (void)a1; (void)a2; (void)a3;
-    obj_t *o = self;
-    o->pos = 0;
-    const float *d = sample;
-    memcpy(o->b + 0x80, &d, sizeof d);
-    int end = FRAMES; memcpy(o->b + 0x88, &end, 4);
-    o->b[0x68] = 0;
+    static int16_t pcm[FRAMES];
+    for (int i = 0; i < FRAMES; i++)
+        pcm[i] = (int16_t)lrintf(3000.0f * sinf(6.2831853f * 100.0f * i / 44100.0f));
+    if (carrier) {
+        fm_patch p;
+        fm_preset_get(fm_preset_find(preset), &p);
+        fm_carrier_encode(&p, root, pcm, FRAMES);
+    }
+    for (int i = 0; i < FRAMES; i++) {
+        frames_f[i] = pcm[i] / 32768.0f;
+        frames_i[i] = pcm[i];
+    }
+}
+
+/* fake stock render: delay, then interpolated (here: nearest) frames x the gain ramp */
+static uintptr_t fake_render(void *self, uintptr_t a_buf, uintptr_t a_n, uintptr_t a3, uintptr_t a4,
+                             uintptr_t a5, uintptr_t a6, uintptr_t a7)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6; (void)a7;
+    gen_t *g = self;
+    float *buf = (float *)a_buf;
+    int n = (int)a_n, delay;
+    memcpy(&delay, g->b + 192, 4);
+    int d = delay > n ? n : delay;
+    memset(buf, 0, (size_t)d * 4);
+    seti(g, 192, delay - d);
+    float cur = getf(g, 88), tgt = getf(g, 92), step = getf(g, 96);
+    uint64_t pos = getu64(g, 368);
+    uint64_t inc = (uint64_t)(g_ratio * 4294967296.0);
+    for (int k = d; k < n; k++) {
+        if (cur != tgt) { cur += step; cur = step >= 0 ? fminf(cur, tgt) : fmaxf(cur, tgt); }
+        uint64_t i = pos >> 32;
+        if (i >= FRAMES) return 0;
+        buf[k] = g_src[i] * cur;
+        pos += inc;
+    }
+    setf(g, 88, cur);
+    setu64(g, 368, pos);
+    return (pos >> 32) < FRAMES;
+}
+static uintptr_t fake_start(void *self, uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4,
+                            uintptr_t a5, uintptr_t a6, uintptr_t a7)
+{
+    (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; (void)a7;
+    gen_t *g = self;
+    setu64(g, 368, 0);
+    setu64(g, 328, PLAIN);
+    memcpy(g->b + 240, &sample, 8);
     return 1;
 }
-static uintptr_t fake_stop(void *self, uintptr_t a1, uintptr_t a2, uintptr_t a3)
+static uintptr_t fake_stop(void *self, uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4,
+                           uintptr_t a5, uintptr_t a6, uintptr_t a7)
 {
-    (void)self; (void)a1; (void)a2; (void)a3;
+    (void)self; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; (void)a7;
     return 0;
 }
 
-static void new_obj(obj_t *o, float gl, float gr, double ratio)
+static void new_gen(gen_t *g, float gain)
 {
-    memset(o, 0, sizeof *o);
-    setf(o, 72, gl);
-    setf(o, 76, gr);
-    setd(o, 48, ratio);
+    memset(g, 0, sizeof *g);
+    setf(g, 88, gain);
+    setf(g, 92, gain);
 }
 
 static int crossings(const float *x, int n)
@@ -78,134 +120,128 @@ static int crossings(const float *x, int n)
     return c;
 }
 
-/* fill `sample` with a quiet tone, as int16 / 32768; with or without a carrier header */
-static void make_sample(int carrier, int damage)
+static void play(gen_t *g, float *out, int blocks)
 {
-    static int16_t pcm[FRAMES];
-    for (int i = 0; i < FRAMES; i++)
-        pcm[i] = (int16_t)lrintf(3000.0f * sinf(6.2831853f * 100.0f * i / 44100.0f));
-    if (carrier) {
-        fm_patch p;
-        fm_preset_get(fm_preset_find("E.Piano"), &p);
-        fm_carrier_encode(&p, 60, pcm, FRAMES);
-        if (damage)
-            pcm[100] ^= 1;
-    }
-    for (int i = 0; i < FRAMES; i++)
-        sample[i] = pcm[i] / 32768.0f;
-}
-
-static void run(obj_t *o, float *L, float *R, int blocks)
-{
-    for (int b = 0; b < blocks; b++) {
-        float *out[2] = {L + b * N, R + b * N};
-        vh_test_process(o, out, 0, N);
-    }
+    for (int b = 0; b < blocks; b++)
+        vh_test_render(g, out + b * N, N);
 }
 
 int main(void)
 {
-    static float L[N * 400], R[N * 400];
-    obj_t o;
+    static float out[N * 800], ref[N * 800];
+    gen_t g;
+    char msg[256];
 
-    /* a normal sample: the hook is transparent */
-    vh_test_setup(fake_start, fake_stop, fake_process);
-    make_sample(0, 0);
-    new_obj(&o, 0.5f, 0.25f, 1.0);
-    vh_test_start(&o, 0);
-    memset(L, 0, sizeof L); memset(R, 0, sizeof R);
-    run(&o, L, R, 10);
+    /* 1. a normal sample: transparent */
+    make_frames(0, NULL, 60);
+    build_chain(frames_f);
+    vh_test_setup(fake_start, fake_stop, fake_render, PLAIN);
+    new_gen(&g, 0.5f);
+    vh_test_start(&g);
+    play(&g, out, 10);
     double d = 0;
-    for (int i = 0; i < 10 * N; i++) {
-        d = fmax(d, fabs(L[i] - 0.5f * sample[i]));
-        d = fmax(d, fabs(R[i] - 0.25f * sample[i]));
-    }
+    for (int i = 0; i < 10 * N; i++) d = fmax(d, fabs(out[i] - 0.5f * frames_f[i]));
     CHECK(d == 0.0 && vh_stats.fm_starts == 0, "normal sample: stock output unchanged (diff %.1e)", d);
+    CHECK(vh_poll(msg, sizeof msg) == 0, "discovery: nothing to learn from a normal sample");
 
-    /* an FM carrier: FM replaces the sample, with the stock gains */
-    vh_test_setup(fake_start, fake_stop, fake_process);
-    make_sample(1, 0);
-    new_obj(&o, 0.5f, 0.25f, 1.0);
-    vh_test_start(&o, 0);
-    CHECK(vh_stats.fm_starts == 1 && vh_stats.active == 1, "carrier detected at start (root %d)", vh_stats.last_root);
-    memset(L, 0, sizeof L); memset(R, 0, sizeof R);
-    run(&o, L, R, 300); /* the fake sample lasts 344.5 blocks: still sounding */
-    CHECK(stock_gains_seen[0] == 0.0f && stock_gains_seen[1] == 0.0f, "stock reader ran with gains 0");
-    CHECK(getf(&o, 72) == 0.5f && getf(&o, 76) == 0.25f, "gains restored after each call");
-    fm_patch p; fm_preset_get(fm_preset_find("E.Piano"), &p);
+    /* 2. a carrier (another file: another Sample object), path not known yet:
+     * plays as a recording, then discovery learns */
+    make_frames(1, "E.Piano", 60);
+    build_chain(frames_f);
+    new_gen(&g, 0.5f);
+    vh_test_start(&g);
+    CHECK(vh_stats.fm_starts == 0, "carrier, path unknown: plays as the recording first");
+    int learned = vh_poll(msg, sizeof msg);
+    CHECK(learned, "discovery: %s", msg);
+    disc_path_t p[4];
+    int np = disc_paths(p, 4);
+    CHECK(np == 1 && p[0].hops == 4 && p[0].off[0] == 240 && p[0].off[1] == 368 && p[0].off[2] == 40 &&
+              p[0].off[3] == 0 && p[0].data_off == 0 && p[0].fmt == FM_FMT_F32,
+          "path = gen +240 +368 +40 +0, float32");
+
+    /* 3. next note: live FM x the stock gain */
+    new_gen(&g, 0.7f);
+    vh_test_start(&g);
+    CHECK(vh_stats.fm_starts == 1 && vh_stats.active == 1, "next note: FM voice claimed (root %d)", vh_stats.last_root);
+    play(&g, out, 600);
+    fm_patch ep; fm_preset_get(fm_preset_find("E.Piano"), &ep);
     fm_voice v; fm_voice_init(&v, 44100.0f); fm_voice_note_on(&v, 1.0f);
-    static float ref[N * 300];
-    for (int b = 0; b < 300; b++) fm_voice_render(&v, &p, 440.0f * powf(2.0f, -9.0f / 12.0f), ref + b * N, N);
+    for (int b = 0; b < 600; b++) fm_voice_render(&v, &ep, 440.0f * powf(2.0f, -9.0f / 12.0f), ref + b * N, N);
     d = 0;
-    for (int i = 0; i < 300 * N; i++) {
-        d = fmax(d, fabs(L[i] - 0.5f * ref[i]));
-        d = fmax(d, fabs(R[i] - 0.25f * ref[i]));
-    }
-    CHECK(d < 1e-6, "output = FM engine x stock gains (diff %.1e)", d);
+    for (int i = 0; i < 600 * N; i++) d = fmax(d, fabs(out[i] - 0.7f * ref[i]));
+    CHECK(d < 1e-6, "output = FM engine x stock gain (diff %.1e)", d);
 
-    /* pitch follows the stock increment (tune, Keys mode) */
-    vh_test_setup(fake_start, fake_stop, fake_process);
+    /* 4. pitch follows how far the stock position moves */
+    make_frames(1, "Sine", 69); /* root A4 */
+    new_gen(&g, 1.0f);
+    g_ratio = 2.0;
+    vh_test_start(&g);
+    play(&g, out, 340); /* the fake sample lasts FRAMES / 2 frames at ratio 2 */
+    int c = crossings(out + 441, 20000);
+    CHECK(abs(c - (int)(2 * 880 * 20000 / 44100.0)) <= 3, "ratio 2 on root A4: %d crossings in 20000 frames (880 Hz)", c);
+    g_ratio = 1.0;
+
+    /* 5. gain ramp and start delay */
+    new_gen(&g, 0.0f);
+    setf(&g, 92, 1.0f);
+    setf(&g, 96, 1.0f / 100.0f); /* ramp over 100 frames */
+    seti(&g, 192, 30);           /* 30 frames of silence first */
+    vh_test_start(&g);
+    play(&g, out, 4);
+    float before = 0; for (int k = 0; k < 30; k++) before = fmaxf(before, fabsf(out[k]));
     fm_patch sine; fm_preset_get(fm_preset_find("Sine"), &sine);
-    static int16_t pcm[FRAMES];
-    memset(pcm, 0, sizeof pcm);
-    fm_carrier_encode(&sine, 69, pcm, FRAMES); /* root A4 = 440 Hz */
-    for (int i = 0; i < FRAMES; i++) sample[i] = pcm[i] / 32768.0f;
-    new_obj(&o, 1.0f, 1.0f, 2.0); /* one octave up */
-    vh_test_start(&o, 0);
-    memset(L, 0, sizeof L); memset(R, 0, sizeof R);
-    run(&o, L, R, 345);
-    int c = crossings(L + 441, 44100 - 441);
-    CHECK(abs(c - 2 * 880 * 99 / 100) <= 4, "ratio 2 on root A4: %d crossings in 0.99 s (880 Hz)", c);
+    fm_voice_init(&v, 44100.0f); fm_voice_note_on(&v, 1.0f);
+    float y[256]; fm_voice_render(&v, &sine, 440.0f, y, 256 - 30);
+    d = 0; float gg = 0;
+    for (int k = 30; k < 256; k++) { if (gg < 1.0f) gg = fminf(gg + 0.01f, 1.0f); d = fmax(d, fabs(out[k] - y[k - 30] * gg)); }
+    CHECK(before == 0.0f && d < 1e-6, "start delay kept silent, then FM x the gain ramp (diff %.1e)", d);
 
-    /* stock fade-out ramp is applied to FM too */
-    vh_test_setup(fake_start, fake_stop, fake_process);
-    new_obj(&o, 1.0f, 1.0f, 1.0);
-    vh_test_start(&o, 0);
-    memset(L, 0, sizeof L); memset(R, 0, sizeof R);
-    run(&o, L, R, 20);
-    setf(&o, 88, 1.0f);
-    setf(&o, 92, 1.0f / 64.0f); /* fade over 64 frames */
-    float *out2[2] = {L + 20 * N, R + 20 * N};
-    vh_test_process(&o, out2, 0, N);
-    float tail = 0; for (int k = 64; k < N; k++) tail = fmaxf(tail, fabsf(L[20 * N + k]));
-    CHECK(tail == 0.0f && fabsf(L[20 * N + 1]) > 0.0f, "fade-out ramp: silent after 64 frames");
+    /* 6. not the plain mono render: stock, released, counted */
+    new_gen(&g, 1.0f);
+    vh_test_start(&g);
+    setu64(&g, 328, PLAIN + 0x100);
+    play(&g, out, 2);
+    d = 0; for (int i = 0; i < 2 * N; i++) d = fmax(d, fabs(out[i] - frames_f[i]));
+    CHECK(d == 0.0 && vh_stats.unsupported == 1 && vh_stats.active == 0, "stereo/stretch layer: stock recording");
 
-    /* the voice ends when stock process returns 0, or at stop */
-    vh_test_setup(fake_start, fake_stop, fake_process);
-    new_obj(&o, 1.0f, 1.0f, 1.0);
-    vh_test_start(&o, 0);
-    memset(L, 0, sizeof L); memset(R, 0, sizeof R);
-    run(&o, L, R, 400); /* the fake sample ends after 344.5 blocks */
-    CHECK(vh_stats.active == 0, "FM voice freed when the sample ends");
-    vh_test_start(&o, 0);
-    vh_test_stop(&o);
+    /* 7. end of sample and stop free the FM voice */
+    new_gen(&g, 1.0f);
+    vh_test_start(&g);
+    play(&g, out, 800); /* past the end */
+    CHECK(vh_stats.active == 0, "FM voice freed when the stock layer ends");
+    vh_test_start(&g);
+    vh_test_stop(&g);
     CHECK(vh_stats.active == 0, "FM voice freed at stop");
 
-    /* a damaged header: no FM, counted */
-    vh_test_setup(fake_start, fake_stop, fake_process);
-    make_sample(1, 1);
-    new_obj(&o, 1.0f, 1.0f, 1.0);
-    vh_test_start(&o, 0);
-    CHECK(vh_stats.fm_starts == 0 && vh_stats.bad_headers == 1, "damaged header: plays as a sample, counted");
+    /* 8. discovery also finds int16 frames */
+    disc_path_t q; int reads = 0;
+    void *old_holder = holder;
+    build_chain(frames_i);
+    gen_t g2; new_gen(&g2, 1.0f); memcpy(g2.b + 240, &sample, 8);
+    int ok = disc_search(&g2, 0, 0, &q, &reads);
+    char desc[160]; disc_describe(&q, desc, sizeof desc);
+    CHECK(ok && q.fmt == FM_FMT_I16, "int16 frames found too: %s (%d reads)", desc, reads);
+    (void)old_holder;
 
-    /* vh_install: checks the stock vtable, swaps 3 entries, keeps it read-only */
-    const uintptr_t VT = 0x6dd6098, TI = 0x715dab8;
-    const uintptr_t M[5] = {0x4477cf0, 0x4477d20, 0x44780b0, 0x4477e20, 0x44785f0};
-    size_t span = 0x7200000;
+    /* 9. vh_install: checks the 16 stock entries, swaps 0, 3 and 7 */
+    const uintptr_t VT = 0x6da6430, TI = 0x6e84c30;
+    const uintptr_t M[16] = {0x220d720, 0x21fdee0, 0x20c1430, 0x220ef30, 0x220d960, 0x220d660, 0x220d690, 0x220f490,
+                             0x220db70, 0x220db30, 0x20bfa80, 0x220d880, 0x220dee0, 0x220d730, 0x220d7a0, 0x220dd30};
+    size_t span = 0x7300000;
     char *base = mmap(NULL, span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     uintptr_t *vt = (uintptr_t *)(base + VT);
     vt[-1] = (uintptr_t)base + TI;
-    for (int i = 0; i < 5; i++) vt[i] = (uintptr_t)base + M[i];
-    char page_note[8];
-    (void)page_note;
+    for (int i = 0; i < 16; i++) vt[i] = (uintptr_t)base + M[i];
     mprotect((void *)((uintptr_t)vt & ~(uintptr_t)4095), 8192, PROT_READ);
-    char msg[160];
     const char *bid = "1dac7f481a0fe8d128e435ace88d7e6aece0c9c9";
     CHECK(vh_install((uintptr_t)base, "0000", msg, sizeof msg) == 0, "unknown build: no hooks (%s)", msg);
-    int ok = vh_install((uintptr_t)base, bid, msg, sizeof msg);
-    int swapped = vt[2] != (uintptr_t)base + M[2] && vt[3] != (uintptr_t)base + M[3] &&
-                  vt[4] != (uintptr_t)base + M[4] && vt[0] == (uintptr_t)base + M[0];
-    CHECK(ok && swapped, "stock vtable: entries 2-4 swapped, 0-1 kept (%s)", msg);
+    ok = vh_install((uintptr_t)base, bid, msg, sizeof msg);
+    int swapped = 1;
+    for (int i = 0; i < 16; i++) {
+        int mine = i == 0 || i == 3 || i == 7;
+        swapped &= mine ? vt[i] != (uintptr_t)base + M[i] : vt[i] == (uintptr_t)base + M[i];
+    }
+    CHECK(ok && swapped, "stock vtable: entries 0, 3, 7 swapped, the others kept (%s)", msg);
     CHECK(vh_install((uintptr_t)base, bid, msg, sizeof msg) == 0, "second install refused: %s", msg);
     munmap(base, span);
 

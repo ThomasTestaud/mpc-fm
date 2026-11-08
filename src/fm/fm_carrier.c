@@ -114,6 +114,50 @@ static int read_bytes(const float *f, int count, float scale, unsigned char *b, 
 
 static const float SCALES[2] = {32768.0f, 32767.0f};
 
+/* Other formats: the 16-bit value of frame i, its low nibble. */
+static inline int nibble_fmt(const void *f, int fmt, int i)
+{
+    if (fmt == FM_FMT_I16) {
+        int16_t v;
+        memcpy(&v, (const char *)f + 2 * i, 2);
+        return v & 0xf;
+    }
+    int32_t v; /* FM_FMT_I32: 16-bit sample in the high half */
+    memcpy(&v, (const char *)f + 4 * i, 4);
+    return (v >> 16) & 0xf;
+}
+
+static int read_bytes_fmt(const void *f, int fmt, int count, unsigned char *b, int nbytes)
+{
+    if (count < nbytes * 2)
+        return 0;
+    for (int i = 0; i < nbytes; i++)
+        b[i] = (unsigned char)(nibble_fmt(f, fmt, 2 * i) | nibble_fmt(f, fmt, 2 * i + 1) << 4);
+    return 1;
+}
+
+int fm_carrier_frame_bytes(int fmt) { return fmt == FM_FMT_I16 ? 2 : 4; }
+
+int fm_carrier_has_magic_fmt(const void *frames, int fmt, int count)
+{
+    if (fmt == FM_FMT_F32)
+        return fm_carrier_has_magic(frames, count);
+    unsigned char b[4];
+    return read_bytes_fmt(frames, fmt, count, b, 4) && memcmp(b, MAGIC, 4) == 0;
+}
+
+int fm_carrier_decode_fmt(const void *frames, int fmt, int count, fm_patch *p, int *root_note)
+{
+    if (fmt == FM_FMT_F32)
+        return fm_carrier_decode(frames, count, p, root_note);
+    unsigned char b[FM_CARRIER_BYTES];
+    if (!read_bytes_fmt(frames, fmt, count, b, 4) || memcmp(b, MAGIC, 4) != 0)
+        return 0;
+    if (!read_bytes_fmt(frames, fmt, count, b, FM_CARRIER_BYTES))
+        return -1;
+    return unpack(b, p, root_note);
+}
+
 int fm_carrier_has_magic(const float *frames, int count)
 {
     unsigned char b[4];
