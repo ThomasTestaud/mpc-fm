@@ -172,6 +172,9 @@ int vh_gate_always = 1;
 
 int vh_active_voices(void) { return __atomic_load_n(&vh_active, __ATOMIC_RELAXED); }
 
+static int g_silent;
+void vh_set_silent(int on) { g_silent = on; }
+
 static inline uint64_t u64(void *o, int off) { uint64_t v; memcpy(&v, (char *)o + off, 8); return v; }
 static inline void set_u64(void *o, int off, uint64_t v) { memcpy((char *)o + off, &v, 8); }
 
@@ -370,6 +373,9 @@ void vh_post_render(vh_regs *r, uint64_t ret, vh_ctx *c)
         float hz = (float)((double)s->root_hz * s->ratio);
         float y[CHUNK];
         int bad = 0;
+        double stock_e = 0, fm_e = 0;
+        for (int k = 0; k < m; k++)
+            stock_e += (double)buf[d + k] * buf[d + k];
         uint32_t gb, tb;
         memcpy(&tb, &target, 4);
         for (int done = 0; done < m && !bad;) {
@@ -387,7 +393,8 @@ void vh_post_render(vh_regs *r, uint64_t ret, vh_ctx *c)
                     g += step;
                     g = step >= 0.0f ? (g < target ? g : target) : (g > target ? g : target);
                 }
-                out[k] = y[k] * g;
+                out[k] = g_silent ? 0.0f : y[k] * g;
+                fm_e += (double)out[k] * out[k];
             }
             done += len;
         }
@@ -408,6 +415,10 @@ void vh_post_render(vh_regs *r, uint64_t ret, vh_ctx *c)
         if (dt > atomic_load_explicit(&vh_stats.fm_max_ns, memory_order_relaxed))
             atomic_store_explicit(&vh_stats.fm_max_ns, dt, memory_order_relaxed);
         atomic_store_explicit(&vh_stats.last_ratio_milli, (uint32_t)(s->ratio * 1000.0),
+                              memory_order_relaxed);
+        atomic_store_explicit(&vh_stats.stock_rms_micro, (uint32_t)(sqrt(stock_e / m) * 1e6),
+                              memory_order_relaxed);
+        atomic_store_explicit(&vh_stats.fm_rms_micro, (uint32_t)(sqrt(fm_e / m) * 1e6),
                               memory_order_relaxed);
     }
     if (!(ret & 0xff))

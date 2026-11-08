@@ -442,7 +442,57 @@ typedef struct {
     unsigned starts, fm;
     int algorithm;
     unsigned char nib[8];
+    char name[64];
 } sample_row;
+
+/* The sample's file name: a text that ends in ".wav" (or has a "/"),
+ * pointed to by a field of the Sample object or of an object it points to
+ * (safe reads, logger thread only). */
+static int text_at(uintptr_t p, char *out, size_t cap)
+{
+    char t[96];
+    if (disc_read(t, p, sizeof t) != 0)
+        return 0;
+    size_t n = 0;
+    while (n < sizeof t && t[n] >= 0x20 && t[n] < 0x7f)
+        n++;
+    if (n < 4 || n == sizeof t || t[n] != 0)
+        return 0;
+    t[n] = 0;
+    int wav = 0;
+    for (size_t i = 0; i + 4 <= n; i++)
+        if ((t[i] == '.') && (t[i + 1] | 32) == 'w' && (t[i + 2] | 32) == 'a' && (t[i + 3] | 32) == 'v')
+            wav = 1;
+    if (!wav)
+        return 0;
+    const char *base = strrchr(t, '/');
+    base = base ? base + 1 : t;
+    size_t len = strlen(base) < cap - 1 ? strlen(base) : cap - 1; /* names may be cut */
+    memcpy(out, base, len);
+    out[len] = 0;
+    return 1;
+}
+
+static int plausible_ptr(uintptr_t v) { return v >= 0x10000 && v < (1ull << 48) && !(v & 7); }
+
+static void sample_name(uintptr_t sample, char *out, size_t cap)
+{
+    uintptr_t f[128];
+    snprintf(out, cap, "?");
+    if (disc_read(f, sample, sizeof f) != 0)
+        return;
+    for (int i = 0; i < 128; i++) /* fields pointing at the text */
+        if (plausible_ptr(f[i]) && text_at(f[i], out, cap))
+            return;
+    for (int i = 0; i < 128; i++) { /* one object further (a file object) */
+        uintptr_t g[64];
+        if (!plausible_ptr(f[i]) || disc_read(g, f[i], sizeof g) != 0)
+            continue;
+        for (int k = 0; k < 64; k++)
+            if (plausible_ptr(g[k]) && text_at(g[k], out, cap))
+                return;
+    }
+}
 static sample_row g_samples[24];
 static int g_nsamples;
 static uint64_t g_note_cursor;
@@ -464,6 +514,7 @@ static void note_rows(void)
             r->kind = t->kind;
             r->vt_off = t->vt_off;
             r->fm_now = -1;
+            sample_name(t->sample, r->name, sizeof r->name);
         }
         if (!r)
             continue;
@@ -476,12 +527,15 @@ static void note_rows(void)
             char nb[40] = "";
             for (int k = 0; k < 8; k++)
                 snprintf(nb + strlen(nb), sizeof nb - strlen(nb), " %d", t->nib[k] == 0xff ? -1 : t->nib[k]);
+            char nm[64];
+            sample_name(t->sample, nm, sizeof nm); /* the object may hold another file now */
+            memcpy(r->name, nm, sizeof r->name);
             if (t->fm)
-                event("sample %#lx (%s, vtable app+%#x): live FM, algorithm %d",
-                      (unsigned long)t->sample, vh_kind_name(t->kind), t->vt_off, t->algorithm);
+                event("sample %#lx \"%s\" (%s): live FM, algorithm %d", (unsigned long)t->sample, nm,
+                      vh_kind_name(t->kind), t->algorithm);
             else
-                event("sample %#lx (%s, vtable app+%#x): plays as a sample; first nibbles%s",
-                      (unsigned long)t->sample, vh_kind_name(t->kind), t->vt_off, nb);
+                event("sample %#lx \"%s\" (%s): plays as a sample; first nibbles%s",
+                      (unsigned long)t->sample, nm, vh_kind_name(t->kind), nb);
             r->fm_now = t->fm;
         }
     }
@@ -513,11 +567,14 @@ static void status_fm(sbuf *b)
               (double)atomic_load(&vh_stats.fm_max_ns) / 1e3,
               atomic_load(&vh_stats.last_ratio_milli) / 1000.0, atomic_load(&vh_stats.last_root),
               (double)atomic_load(&vh_stats.lookup_max_ns) / 1e3);
+    sb_printf(b, "last FM block: stock output it replaced RMS %.4f, FM output RMS %.4f%s\n",
+              atomic_load(&vh_stats.stock_rms_micro) / 1e6, atomic_load(&vh_stats.fm_rms_micro) / 1e6,
+              getenv("MPCFM_TEST_SILENT") ? " (TEST: FM voices silent)" : "");
     sb_printf(b, "samples played (provider, starts, as FM, first nibbles; a carrier: 13 4 0 5 6 4 13 4):\n");
     for (int i = 0; i < g_nsamples; i++) {
         const sample_row *r = &g_samples[i];
-        sb_printf(b, "  %#lx %-14s starts %u FM %u%s", (unsigned long)r->sample, vh_kind_name(r->kind),
-                  r->starts, r->fm, r->fm ? " (algorithm " : "");
+        sb_printf(b, "  %#lx %-22.22s %-14s starts %u FM %u%s", (unsigned long)r->sample, r->name,
+                  vh_kind_name(r->kind), r->starts, r->fm, r->fm ? " (algorithm " : "");
         if (r->fm)
             sb_printf(b, "%d)", r->algorithm);
         sb_printf(b, " |");
@@ -643,6 +700,8 @@ __attribute__((constructor)) static void mpcfm_init(void)
     probe_init(!(v && strcmp(v, "0") == 0));
 
     /* Before the app starts its threads: swap the sample voice methods. */
+    v = getenv("MPCFM_TEST_SILENT");
+    vh_set_silent(v && *v == '1');
     v = getenv("MPCFM_HOOKS");
     if (v && strcmp(v, "0") == 0)
         snprintf(g_hook_msg, sizeof g_hook_msg, "off (MPCFM_HOOKS=0)");

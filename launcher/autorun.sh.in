@@ -78,6 +78,13 @@ if [ "$SHIM" = 1 ] && [ -z "$OFF" ]; then
     copy "$DIR/mpcfm/fm.so" "$RUN/fm.so" 644 || OFF="copy failed"
 fi
 
+# Test of the output path: FM voices play silence (file mpcfm/TEST_SILENT_FM).
+if [ -e "$DIR/mpcfm/TEST_SILENT_FM" ]; then
+    MPCFM_TEST_SILENT=1
+    export MPCFM_TEST_SILENT
+    log "TEST_SILENT_FM: FM voices will play silence"
+fi
+
 if [ "$SHIM" = 1 ]; then
     MPCFM_BIN="$RUN/bin"
     MPCFM_STATE="$RUN"

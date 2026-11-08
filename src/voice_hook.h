@@ -28,6 +28,8 @@ typedef struct {
     _Atomic uint64_t fm_max_ns;     /* longest FM render of one call */
     _Atomic uint64_t lookup_max_ns; /* longest carrier check at a note start */
     _Atomic uint32_t last_ratio_milli; /* last pitch ratio x 1000 */
+    _Atomic uint32_t stock_rms_micro;  /* last FM block: loudness of the stock output replaced */
+    _Atomic uint32_t fm_rms_micro;     /* ... and of what we wrote (x 1e6) */
     _Atomic int last_root;
 } vh_stats_t;
 
@@ -35,6 +37,9 @@ extern vh_stats_t vh_stats;
 
 /* FM voices now. */
 int vh_active_voices(void);
+
+/* Test of the output path: FM voices write silence instead of FM. */
+void vh_set_silent(int on);
 
 /* One note start, for the logs (written by the audio thread). */
 enum { VH_KIND_UNKNOWN, VH_KIND_MEMORY, VH_KIND_DISK, VH_KIND_RECORDED };
