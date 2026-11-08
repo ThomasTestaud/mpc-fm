@@ -1,0 +1,9 @@
+.tools/
+build/
+dist/
+*.o
+*.so
+
+# Never commit SampQOL files (closed source, no redistribution).
+mpcqol.so
+qol-*.sh

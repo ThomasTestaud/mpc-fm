@@ -1,0 +1,14 @@
+{
+  "value0": {
+    "scripts": [
+      {
+        "path": "autorun.sh",
+        "askQuestion": false,
+        "message": "Start SampQOL OS with mpc-fm?\nB1 = Start, B3 = Cancel",
+        "yesButtonText": "Start",
+        "noButtonText": "Cancel"
+      }
+    ],
+    "files": []
+  }
+}

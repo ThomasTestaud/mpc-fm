@@ -1,0 +1,39 @@
+mpc-fm: FM synth add-on for the Akai MPC Sample, next to SampQOL OS
+==================================================================
+
+mpc-fm is a separate project. It does not contain SampQOL OS and does not
+change any SampQOL file. Get SampQOL OS only from its official page:
+https://github.com/snarebes/SampQOL-OS/releases
+
+This version (phase 0) makes no sound. It only measures the audio timing
+and CPU use of the MPC, to plan the FM engine.
+
+Install
+-------
+1. MPC Sample firmware 1.3.0 (1.3.0.12), as SampQOL OS needs.
+2. Copy the folder "autorun" of mpc-fm to the root of the SD card.
+3. Download SampQOL OS, unzip it, and copy ITS folder "autorun" into our
+   folder, renamed to "sampqol". Do not change any file in it.
+
+   SD card
+   +-- autorun/              mpc-fm (starts first)
+       +-- autorun.json, autorun.check, autorun.sh
+       +-- mpcfm/            fm.so, setarch, INSTALL.txt
+       +-- sampqol/          the official SampQOL "autorun" folder, unchanged
+       +-- logs/             made at start-up
+
+4. Put the card in the MPC and switch it on. SampQOL OS starts as usual.
+
+Results
+-------
+autorun/logs/mpcfm-status.txt   audio timing, threads, CPU clocks (every 10 s)
+autorun/logs/mpcfm-events.log   start, xruns, late audio blocks
+autorun/logs/mpcfm-launch.log   was FM added to the app, and why not
+With root SSH: /tmp/mpcfm/status.txt is updated every second.
+
+Turn FM off
+-----------
+- Create a file "DISABLE" in autorun/mpcfm/: SampQOL OS starts without FM.
+- If the app stops less than 10 minutes after a start with FM, FM stays
+  off until the next start-up (see mpcfm-launch.log).
+- Remove the card: the MPC starts stock.

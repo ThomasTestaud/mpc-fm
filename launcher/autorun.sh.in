@@ -1,0 +1,71 @@
+#!/bin/sh
+# mpc-fm @VERSION@ launcher for the Akai MPC Sample.
+#
+# The stock script runner starts this file (it checks autorun.check, made
+# from autorun.json and this file). We start SampQOL OS from its unchanged
+# official folder ./sampqol and add our fm.so to the app process:
+#
+#   this autorun.sh -> sampqol/autorun.sh -> qol-run.sh -> "setarch" (our
+#   stand-in, first in PATH) -> real setarch -> "MPC Sample" with
+#   LD_PRELOAD="/tmp/mpcqol.so /run/mpcfm/fm.so"
+#
+# If our files are wrong or missing: SampQOL OS starts without FM.
+# If SampQOL OS is missing: nothing starts, the MPC stays stock.
+# To turn FM off: create the file mpcfm/DISABLE (any content).
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+QOL="$DIR/sampqol"
+RUN="${MPCFM_RUN:-/run/mpcfm}"
+
+log() {
+    mkdir -p "$DIR/logs"
+    echo "$(date '+%F %T') autorun: $*" >> "$DIR/logs/mpcfm-launch.log"
+} 2>/dev/null
+
+# SHA256 of our files, written at build time. autorun.check covers this
+# script, so the stock runner also protects these pins.
+PINS="@PINS@"
+
+if [ ! -f "$QOL/autorun.sh" ]; then
+    log "no SampQOL OS in $QOL: the MPC stays stock"
+    exit 0
+fi
+
+FM=1
+if [ -e "$DIR/mpcfm/DISABLE" ]; then
+    log "mpcfm/DISABLE exists: FM off"
+    FM=0
+elif ! (cd "$DIR/mpcfm" 2>/dev/null && echo "$PINS" | sha256sum -c >/dev/null 2>&1); then
+    log "mpcfm files do not match this autorun.sh: FM off"
+    FM=0
+fi
+
+# Copy to RAM: the SD card is mounted noexec, and the app must keep working
+# if the card goes away. Copy, then rename: a running app keeps its old file.
+if [ "$FM" = 1 ]; then
+    if mkdir -p "$RUN/bin" 2>/dev/null &&
+        cp "$DIR/mpcfm/fm.so" "$RUN/.fm.so.new" 2>/dev/null &&
+        chmod 644 "$RUN/.fm.so.new" && mv -f "$RUN/.fm.so.new" "$RUN/fm.so" &&
+        cp "$DIR/mpcfm/setarch" "$RUN/bin/.setarch.new" 2>/dev/null &&
+        chmod 755 "$RUN/bin/.setarch.new" && mv -f "$RUN/bin/.setarch.new" "$RUN/bin/setarch"
+    then
+        :
+    else
+        log "copy to $RUN failed: FM off"
+        FM=0
+    fi
+fi
+
+if [ "$FM" = 1 ]; then
+    MPCFM_SO="$RUN/fm.so"
+    MPCFM_BIN="$RUN/bin"
+    MPCFM_STATE="$RUN"
+    MPCFM_LOGDIR="$DIR/logs"
+    PATH="$RUN/bin:$PATH"
+    export MPCFM_SO MPCFM_BIN MPCFM_STATE MPCFM_LOGDIR PATH
+    log "mpc-fm @VERSION@: start SampQOL OS with FM"
+else
+    log "mpc-fm @VERSION@: start SampQOL OS without FM"
+fi
+
+exec sh "$QOL/autorun.sh"
