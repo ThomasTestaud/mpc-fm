@@ -31,9 +31,9 @@ ENGINE_FLAGS = -O3 -fno-math-errno -ffp-contract=fast -Isrc/fm
 
 ENGINE_SRC = src/fm/fm_engine.c src/fm/fm_presets.c src/fm/fm_carrier.c
 ENGINE_HDR = src/fm/fm_engine.h src/fm/fm_presets.h src/fm/fm_carrier.h
-FM_SRC = src/fm.c src/alsa_probe.c src/voice_hook.c src/discover.c src/crash.c src/fm/fm_engine.c src/fm/fm_carrier.c
+FM_SRC = src/fm.c src/alsa_probe.c src/voice_hook.c src/discover.c src/crash.c src/sampleinfo.c src/fm/fm_engine.c src/fm/fm_carrier.c
 ARM_ASM = src/tramp_hooks.S src/tramp_aarch64.inc
-FM_HDR = src/probe.h src/version.h src/voice_hook.h src/discover.h src/crash.h $(ENGINE_HDR)
+FM_HDR = src/probe.h src/version.h src/voice_hook.h src/discover.h src/crash.h src/sampleinfo.h $(ENGINE_HDR)
 # fm.so: the engine runs in it, so the engine flags; BTI/PAC landing pads
 # like the stock app (no-ops on the A55).
 FM_FLAGS = $(ENGINE_FLAGS) -Isrc
@@ -88,10 +88,10 @@ $(HOST)/fm.so: $(FM_SRC) $(FM_HDR)
 	$(CC_HOST) $(CFLAGS) $(SO_FLAGS) $(FM_FLAGS) -DMPCFM_TARGET_EXE='"$(abspath $(HOST)/fake_app)"' \
 		-o $@ $(FM_SRC) -ldl -lpthread -lm
 
-$(HOST)/test_hook: tests/test_hook.c src/voice_hook.c src/voice_hook.h src/discover.c src/discover.h $(ENGINE_SRC) $(ENGINE_HDR)
+$(HOST)/test_hook: tests/test_hook.c src/voice_hook.c src/voice_hook.h src/discover.c src/discover.h src/sampleinfo.c src/sampleinfo.h $(ENGINE_SRC) $(ENGINE_HDR)
 	@mkdir -p $(@D)
 	$(CC_HOST) $(CFLAGS) -DMPCFM_TEST $(FM_FLAGS) -o $@ tests/test_hook.c \
-		src/voice_hook.c src/discover.c $(ENGINE_SRC) -lm
+		src/voice_hook.c src/discover.c src/sampleinfo.c $(ENGINE_SRC) -lm
 
 $(HOST)/setarch: $(SHIM_SRC) $(SHIM_HDR)
 	@mkdir -p $(@D)

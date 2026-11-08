@@ -10,6 +10,7 @@
 #include <sys/mman.h>
 
 #include "discover.h"
+#include "sampleinfo.h"
 #include "fm/fm_carrier.h"
 #include "fm/fm_engine.h"
 #include "fm/fm_presets.h"
@@ -285,34 +286,72 @@ int main(void)
     vh_poll(msg, sizeof msg);
     CHECK(vh_active_voices() == 0 && disc_searches() == searches0, "normal sample on a known path: no search");
 
-    /* 14. a streamed sample (DiskSample): its header is not on the built-in
-     * path (here: gen+528 holds frames of another, normal buffer), so it is
-     * searched once and then plays live */
+    /* 14. a streamed sample (DiskSample): no memory search; the logger reads
+     * its WAV file and registers it; then its notes are live FM, as long as
+     * the Sample object still holds the same file */
     {
         vh_test_setup(fake_start, fake_stop, fake_render, PLAIN);
-        disc_path_t seed = {2, {528, 0}, 0, FM_FMT_F32};
-        disc_seed(&seed);
-        static float other[64];
-        void *otherp = other, *holder528 = calloc(1, 0x40);
-        memcpy(holder528, &otherp, 8);
         g_provider_vt = VH_TEST_VT_DISK;
-        make_frames(1, "Bell", 60);
+        make_frames(0, NULL, 60); /* in memory: nothing readable as a header */
         build_chain(frames_f);
+        static char path1[] = "/media/CARD/Projects/P_[ProjectData]/FM-Bell-C3002.wav";
+        static char path2[] = "/media/CARD/Other.wav";
+        char *pp = path1;
+        memcpy((char *)sample + 56, &pp, 8); /* the Sample's name field */
         new_gen(&g, 1.0f);
         vh_test_start(&g);
-        memcpy(g.b + 528, &holder528, 8); /* the reader points elsewhere */
-        vh_test_start(&g);
-        CHECK(vh_active_voices() == 0, "DiskSample, header not on the built-in path: sample at first");
         unsigned s0 = disc_searches();
         vh_poll(msg, sizeof msg);
-        CHECK(disc_searches() == s0 + 1, "DiskSample: one search (%s)", msg);
-        fake_start(&g, 0, 0, 0, 0, 0, 0, 0);
-        memcpy(g.b + 528, &holder528, 8);
-        vh_test_render(&g, out, N); /* no FM voice yet: stock */
+        CHECK(vh_active_voices() == 0 && disc_searches() == s0, "DiskSample: plays the recording, no memory search");
+        name_loc nl;
+        int found = sample_name_loc((uintptr_t)sample, &nl);
+        CHECK(found && nl.i == 7 && nl.k == -1 && !strcmp(nl.base, "FM-Bell-C3002.wav") && !strcmp(nl.path, path1),
+              "name of the Sample object: \"%s\" (field %d)", nl.base, nl.i);
+        fm_patch bell; fm_preset_get(fm_preset_find("Bell"), &bell);
+        vh_disk_add((uintptr_t)sample, (uintptr_t)provider, nl.i, nl.obj, nl.k, nl.ptr, &bell, 60);
         vh_test_start(&g);
-        CHECK(vh_active_voices() == 1, "DiskSample: next note is live FM");
-        vh_poll(msg, sizeof msg);
+        CHECK(vh_active_voices() == 1, "registered streamed carrier: the next note is live FM");
+        pp = path2; /* the same object now holds another file */
+        memcpy((char *)sample + 56, &pp, 8);
+        vh_test_start(&g);
+        CHECK(vh_active_voices() == 0, "same object, other file: not FM (stale entry ignored)");
         g_provider_vt = VH_TEST_VT_MEMORY;
+    }
+
+    /* 15. carrier header read from WAV files: 16, 24, 32-bit, float, stereo */
+    {
+        static int16_t pcm[4000];
+        fm_patch bell, got; fm_preset_get(fm_preset_find("Bell"), &bell);
+        for (int i = 0; i < 4000; i++) pcm[i] = (int16_t)lrintf(9000.0f * sinf(0.02f * i));
+        fm_carrier_encode(&bell, 57, pcm, 4000);
+        const struct { int bits, fmt, ch; const char *what; } F[] = {
+            {16, 1, 1, "16-bit"}, {24, 1, 1, "24-bit"}, {32, 1, 1, "32-bit"}, {32, 3, 1, "float"}, {16, 1, 2, "16-bit stereo"}};
+        for (size_t f = 0; f < sizeof F / sizeof *F; f++) {
+            char path[64]; snprintf(path, sizeof path, "/tmp/mpcfm-test-%d.wav", (int)f);
+            FILE *w = fopen(path, "wb");
+            int bps = F[f].bits / 8, frame = bps * F[f].ch;
+            uint32_t data = 4000u * (uint32_t)frame, v32;
+            uint16_t v16;
+            fwrite("RIFF", 1, 4, w); v32 = 36 + data; fwrite(&v32, 4, 1, w); fwrite("WAVEfmt ", 1, 8, w);
+            v32 = 16; fwrite(&v32, 4, 1, w); v16 = (uint16_t)F[f].fmt; fwrite(&v16, 2, 1, w);
+            v16 = (uint16_t)F[f].ch; fwrite(&v16, 2, 1, w); v32 = 44100; fwrite(&v32, 4, 1, w);
+            v32 = 44100u * (uint32_t)frame; fwrite(&v32, 4, 1, w); v16 = (uint16_t)frame; fwrite(&v16, 2, 1, w);
+            v16 = (uint16_t)F[f].bits; fwrite(&v16, 2, 1, w); fwrite("data", 1, 4, w); fwrite(&data, 4, 1, w);
+            for (int i = 0; i < 4000; i++)
+                for (int c = 0; c < F[f].ch; c++) {
+                    int16_t x = c ? (int16_t)(i * 7) : pcm[i];
+                    if (F[f].bits == 16) fwrite(&x, 2, 1, w);
+                    else if (F[f].bits == 24) { int32_t y = x * 256; fwrite(&y, 3, 1, w); }
+                    else if (F[f].fmt == 3) { float y = x / 32768.0f; fwrite(&y, 4, 1, w); }
+                    else { int32_t y = x * 65536; fwrite(&y, 4, 1, w); }
+                }
+            fclose(w);
+            int root = 0;
+            int r = carrier_from_file(path, &got, &root);
+            CHECK(r == 1 && root == 57 && memcmp(&got, &bell, sizeof got) == 0, "carrier header read from a %s WAV file", F[f].what);
+            remove(path);
+        }
+        CHECK(carrier_from_file("/nonexistent.wav", &got, &got.algorithm) == -1, "missing file: -1");
     }
 
     /* 9. vh_install: checks the 16 stock entries, swaps 0, 3 and 7 */

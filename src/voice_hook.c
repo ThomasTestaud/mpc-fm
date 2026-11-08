@@ -175,6 +175,76 @@ int vh_active_voices(void) { return __atomic_load_n(&vh_active, __ATOMIC_RELAXED
 static int g_silent;
 void vh_set_silent(int on) { g_silent = on; }
 
+/* ---- streamed carriers (filled by the logger, read at note starts) ---- */
+#define DISK_ENTRIES 64
+typedef struct {
+    _Atomic uintptr_t sample; /* 0: free; set last (release) */
+    uintptr_t provider, name_obj, name_ptr;
+    int name_i, name_k, root;
+    fm_patch patch;
+} disk_entry;
+static disk_entry g_disk[DISK_ENTRIES];
+static int g_ndisk;
+
+int vh_disk_count(void) { return __atomic_load_n(&g_ndisk, __ATOMIC_RELAXED); }
+
+int vh_disk_add(uintptr_t sample, uintptr_t provider, int name_i, uintptr_t name_obj, int name_k,
+                uintptr_t name_ptr, const void *patch, int root)
+{
+    /* the same object again (another file now): replace its entry */
+    disk_entry *e = NULL;
+    for (int i = 0; i < DISK_ENTRIES && !e; i++)
+        if (atomic_load_explicit(&g_disk[i].sample, memory_order_relaxed) == sample)
+            e = &g_disk[i];
+    for (int i = 0; i < DISK_ENTRIES && !e; i++)
+        if (!atomic_load_explicit(&g_disk[i].sample, memory_order_relaxed))
+            e = &g_disk[i];
+    if (!e)
+        e = &g_disk[(unsigned)(sample >> 4) % DISK_ENTRIES]; /* full: overwrite one */
+    atomic_store_explicit(&e->sample, 0, memory_order_release);
+    e->provider = provider;
+    e->name_i = name_i;
+    e->name_obj = name_obj;
+    e->name_k = name_k;
+    e->name_ptr = name_ptr;
+    e->root = root;
+    memcpy(&e->patch, patch, sizeof e->patch);
+    atomic_store_explicit(&e->sample, sample, memory_order_release);
+    int n = 0;
+    for (int i = 0; i < DISK_ENTRIES; i++)
+        n += atomic_load_explicit(&g_disk[i].sample, memory_order_relaxed) != 0;
+    __atomic_store_n(&g_ndisk, n, __ATOMIC_RELAXED);
+    return 1;
+}
+
+/* Audio thread: is this streamed Sample a registered carrier? Plain loads
+ * on fields of the live Sample (as provider_kind does). */
+static int disk_lookup(uintptr_t sample, uintptr_t provider, fm_patch *p, int *root)
+{
+    if (!sample || !__atomic_load_n(&g_ndisk, __ATOMIC_RELAXED))
+        return 0;
+    for (int i = 0; i < DISK_ENTRIES; i++) {
+        disk_entry *e = &g_disk[i];
+        if (atomic_load_explicit(&e->sample, memory_order_acquire) != sample)
+            continue;
+        if (e->provider != provider)
+            return 0;
+        uintptr_t v;
+        memcpy(&v, (char *)sample + 8 * e->name_i, 8);
+        if (e->name_k >= 0) {
+            if (v != e->name_obj)
+                return 0;
+            memcpy(&v, (char *)v + 8 * e->name_k, 8);
+        }
+        if (v != e->name_ptr)
+            return 0;
+        *p = e->patch;
+        *root = e->root;
+        return 1;
+    }
+    return 0;
+}
+
 static inline uint64_t u64(void *o, int off) { uint64_t v; memcpy(&v, (char *)o + off, 8); return v; }
 static inline void set_u64(void *o, int off, uint64_t v) { memcpy((char *)o + off, &v, 8); }
 
@@ -227,8 +297,18 @@ static void claim(void *gen)
     vh_note_t note;
     memset(&note, 0, sizeof note);
     note.kind = provider_kind(gen, &note.sample, &note.vt_off);
-    /* The built-in path covers samples in RAM; others may need a search. */
-    int found = disc_lookup(gen, &patch, &root, note.kind != VH_KIND_MEMORY, note.nib);
+    int found;
+    if (note.kind == VH_KIND_DISK) {
+        /* Streamed: its file was read by the logger (vh_disk_add). */
+        uintptr_t prov = 0;
+        if (note.sample)
+            memcpy(&prov, (char *)note.sample + OFF_PROVIDER, 8);
+        found = disk_lookup(note.sample, prov, &patch, &root);
+        memset(note.nib, 0xff, 8);
+    } else {
+        /* In RAM: the built-in path to the frames. */
+        found = disc_lookup(gen, &patch, &root, 0, note.nib);
+    }
     note.fm = found;
     note.algorithm = found ? patch.algorithm + 1 : 0;
     uint64_t slot = __atomic_fetch_add(&g_notes_head, 1, __ATOMIC_ACQ_REL);

@@ -33,7 +33,9 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "fm/fm_carrier.h"
 #include "probe.h"
+#include "sampleinfo.h"
 #include "version.h"
 #include "crash.h"
 #include "discover.h"
@@ -445,54 +447,44 @@ typedef struct {
     char name[64];
 } sample_row;
 
-/* The sample's file name: a text that ends in ".wav" (or has a "/"),
- * pointed to by a field of the Sample object or of an object it points to
- * (safe reads, logger thread only). */
-static int text_at(uintptr_t p, char *out, size_t cap)
-{
-    char t[96];
-    if (disc_read(t, p, sizeof t) != 0)
-        return 0;
-    size_t n = 0;
-    while (n < sizeof t && t[n] >= 0x20 && t[n] < 0x7f)
-        n++;
-    if (n < 4 || n == sizeof t || t[n] != 0)
-        return 0;
-    t[n] = 0;
-    int wav = 0;
-    for (size_t i = 0; i + 4 <= n; i++)
-        if ((t[i] == '.') && (t[i + 1] | 32) == 'w' && (t[i + 2] | 32) == 'a' && (t[i + 3] | 32) == 'v')
-            wav = 1;
-    if (!wav)
-        return 0;
-    const char *base = strrchr(t, '/');
-    base = base ? base + 1 : t;
-    size_t len = strlen(base) < cap - 1 ? strlen(base) : cap - 1; /* names may be cut */
-    memcpy(out, base, len);
-    out[len] = 0;
-    return 1;
-}
+/* A streamed sample seen for the first time: is its file a carrier? */
+static struct {
+    uintptr_t sample, provider, name_ptr;
+} g_inspected[64];
+static int g_ninspected;
 
-static int plausible_ptr(uintptr_t v) { return v >= 0x10000 && v < (1ull << 48) && !(v & 7); }
-
-static void sample_name(uintptr_t sample, char *out, size_t cap)
+static void inspect_disk(uintptr_t sample)
 {
-    uintptr_t f[128];
-    snprintf(out, cap, "?");
-    if (disc_read(f, sample, sizeof f) != 0)
+    uintptr_t prov = 0;
+    if (disc_read(&prov, sample + 368, 8) != 0)
         return;
-    for (int i = 0; i < 128; i++) /* fields pointing at the text */
-        if (plausible_ptr(f[i]) && text_at(f[i], out, cap))
-            return;
-    for (int i = 0; i < 128; i++) { /* one object further (a file object) */
-        uintptr_t g[64];
-        if (!plausible_ptr(f[i]) || disc_read(g, f[i], sizeof g) != 0)
-            continue;
-        for (int k = 0; k < 64; k++)
-            if (plausible_ptr(g[k]) && text_at(g[k], out, cap))
-                return;
+    name_loc l;
+    if (!sample_name_loc(sample, &l) || !strchr(l.path, '/'))
+        return;
+    for (int i = 0; i < g_ninspected; i++)
+        if (g_inspected[i].sample == sample && g_inspected[i].provider == prov &&
+            g_inspected[i].name_ptr == l.ptr)
+            return; /* done already */
+    if (g_ninspected < 64) {
+        g_inspected[g_ninspected].sample = sample;
+        g_inspected[g_ninspected].provider = prov;
+        g_inspected[g_ninspected++].name_ptr = l.ptr;
+    }
+    fm_patch p;
+    int root = 60;
+    int r = carrier_from_file(l.path, &p, &root);
+    if (r == 1) {
+        vh_disk_add(sample, prov, l.i, l.obj, l.k, l.ptr, &p, root);
+        event("streamed sample \"%s\": FM carrier (algorithm %d), live from the next note", l.base,
+              p.algorithm + 1);
+    } else if (r < 0) {
+        event("streamed sample \"%s\": cannot read %s", l.base, l.path);
+    } else if (!strncmp(l.base, "FM-", 3)) {
+        /* An FM file whose copy has no header: the MPC changed the data? */
+        event("streamed sample \"%s\": no FM header in its file %s", l.base, l.path);
     }
 }
+
 static sample_row g_samples[24];
 static int g_nsamples;
 static uint64_t g_note_cursor;
@@ -518,6 +510,8 @@ static void note_rows(void)
         }
         if (!r)
             continue;
+        if (t->kind == VH_KIND_DISK && !t->fm)
+            inspect_disk(t->sample);
         r->starts++;
         r->fm += t->fm != 0;
         memcpy(r->nib, t->nib, 8);
@@ -582,7 +576,7 @@ static void status_fm(sbuf *b)
             sb_printf(b, " %d", r->nib[k] == 0xff ? -1 : r->nib[k]);
         sb_printf(b, "\n");
     }
-    sb_printf(b, "searches run: %u\n", disc_searches());
+    sb_printf(b, "searches run: %u; streamed FM carriers known: %d\n", disc_searches(), vh_disk_count());
     disc_path_t paths[4];
     int n = disc_paths(paths, 4);
     if (!n)

@@ -41,6 +41,16 @@ int vh_active_voices(void);
 /* Test of the output path: FM voices write silence instead of FM. */
 void vh_set_silent(int on);
 
+/* Streamed samples (DiskSample): the logger thread reads the carrier
+ * header from the sample's WAV file and registers it here. A note start
+ * of that Sample object plays FM if its provider and its file-name field
+ * are still the ones seen (so a reused object cannot match).
+ * name_i: field of the Sample object holding the name pointer, or the
+ * field holding an object whose field name_k holds it (name_k >= 0). */
+int vh_disk_add(uintptr_t sample, uintptr_t provider, int name_i, uintptr_t name_obj, int name_k,
+                uintptr_t name_ptr, const void *patch, int root);
+int vh_disk_count(void);
+
 /* One note start, for the logs (written by the audio thread). */
 enum { VH_KIND_UNKNOWN, VH_KIND_MEMORY, VH_KIND_DISK, VH_KIND_RECORDED };
 typedef struct {
