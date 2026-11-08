@@ -37,11 +37,13 @@ static void *sample, *provider, *holder;
 static double g_ratio = 1.0; /* what the fake stock render advances per frame */
 static const float *g_src = frames_f;
 
+static uintptr_t g_provider_vt = VH_TEST_VT_MEMORY;
 static void build_chain(void *data)
 {
     sample = calloc(1, 0x400);
     provider = calloc(1, 0x100);
     holder = calloc(1, 0x40);
+    memcpy(provider, &g_provider_vt, 8); /* its "vtable": what kind of provider */
     memcpy((char *)sample + 368, &provider, 8);
     memcpy((char *)provider + 40, &holder, 8);
     memcpy(holder, &data, 8);
@@ -282,6 +284,36 @@ int main(void)
     vh_test_start(&g);
     vh_poll(msg, sizeof msg);
     CHECK(vh_active_voices() == 0 && disc_searches() == searches0, "normal sample on a known path: no search");
+
+    /* 14. a streamed sample (DiskSample): its header is not on the built-in
+     * path (here: gen+528 holds frames of another, normal buffer), so it is
+     * searched once and then plays live */
+    {
+        vh_test_setup(fake_start, fake_stop, fake_render, PLAIN);
+        disc_path_t seed = {2, {528, 0}, 0, FM_FMT_F32};
+        disc_seed(&seed);
+        static float other[64];
+        void *otherp = other, *holder528 = calloc(1, 0x40);
+        memcpy(holder528, &otherp, 8);
+        g_provider_vt = VH_TEST_VT_DISK;
+        make_frames(1, "Bell", 60);
+        build_chain(frames_f);
+        new_gen(&g, 1.0f);
+        vh_test_start(&g);
+        memcpy(g.b + 528, &holder528, 8); /* the reader points elsewhere */
+        vh_test_start(&g);
+        CHECK(vh_active_voices() == 0, "DiskSample, header not on the built-in path: sample at first");
+        unsigned s0 = disc_searches();
+        vh_poll(msg, sizeof msg);
+        CHECK(disc_searches() == s0 + 1, "DiskSample: one search (%s)", msg);
+        fake_start(&g, 0, 0, 0, 0, 0, 0, 0);
+        memcpy(g.b + 528, &holder528, 8);
+        vh_test_render(&g, out, N); /* no FM voice yet: stock */
+        vh_test_start(&g);
+        CHECK(vh_active_voices() == 1, "DiskSample: next note is live FM");
+        vh_poll(msg, sizeof msg);
+        g_provider_vt = VH_TEST_VT_MEMORY;
+    }
 
     /* 9. vh_install: checks the 16 stock entries, swaps 0, 3 and 7 */
     const uintptr_t VT = 0x6da6430, TI = 0x6e84c30;

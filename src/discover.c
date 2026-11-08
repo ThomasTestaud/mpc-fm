@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #include "discover.h"
 
+#include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
@@ -47,6 +48,7 @@ unsigned disc_searches(void) { return g_searches; }
 static struct {
     uintptr_t key;
     unsigned poll;
+    int tries; /* after 2 failed searches: a normal sample, never again */
 } g_tried[256];
 static int g_ntried;
 static unsigned g_polls;
@@ -61,8 +63,9 @@ int disc_read(void *dst, uintptr_t addr, size_t n)
 #define UNREADABLE (-2)
 
 /* Header at the end of a path: 1 carrier, 0 frames there but no header,
- * -1 damaged header, UNREADABLE: the path does not lead to memory. */
-static int follow(void *gen, const disc_path_t *d, fm_patch *p, int *root)
+ * -1 damaged header, UNREADABLE: the path does not lead to memory.
+ * nib (may be NULL): low nibbles of the first 8 frames read. */
+static int follow(void *gen, const disc_path_t *d, fm_patch *p, int *root, unsigned char *nib)
 {
     uintptr_t q = (uintptr_t)gen;
     for (int i = 0; i < d->hops; i++) {
@@ -75,6 +78,24 @@ static int follow(void *gen, const disc_path_t *d, fm_patch *p, int *root)
     int fb = fm_carrier_frame_bytes(d->fmt);
     if (disc_read(buf, q + (uintptr_t)d->data_off, 8 * (size_t)fb) != 0)
         return UNREADABLE;
+    if (nib)
+        for (int i = 0; i < 8; i++) {
+            int v;
+            if (d->fmt == FM_FMT_I16) {
+                int16_t x;
+                memcpy(&x, buf + 2 * i, 2);
+                v = x;
+            } else if (d->fmt == FM_FMT_I32) {
+                int32_t x;
+                memcpy(&x, buf + 4 * i, 4);
+                v = x >> 16;
+            } else {
+                float x;
+                memcpy(&x, buf + 4 * i, 4);
+                v = (int)lrintf(x * 32768.0f);
+            }
+            nib[i] = (unsigned char)(v & 15);
+        }
     if (!fm_carrier_has_magic_fmt(buf, d->fmt, 8))
         return 0;
     if (disc_read(buf, q + (uintptr_t)d->data_off, (size_t)FM_CARRIER_FRAMES * (size_t)fb) != 0)
@@ -94,20 +115,22 @@ void disc_seed(const disc_path_t *d)
     }
 }
 
-int disc_lookup(void *gen, fm_patch *p, int *root)
+int disc_lookup(void *gen, fm_patch *p, int *root, int allow_search, unsigned char nib[8])
 {
     int n = atomic_load_explicit(&g_npaths, memory_order_acquire);
     int readable = 0;
+    memset(nib, 0xff, 8);
     for (int i = 0; i < n; i++) {
-        int r = follow(gen, &g_paths[i], p, root);
+        int r = follow(gen, &g_paths[i], p, root, readable ? NULL : nib);
         if (r == 1)
             return 1;
         readable |= r != UNREADABLE;
     }
     /* A known path led to frames without a header: a normal sample, no
-     * search. (v0.1.2 searched for every normal sample: tens of thousands
-     * of reads that made the audio drop out.) */
-    if (readable)
+     * search, unless the caller says this kind of sample may be out of
+     * the paths' reach. (v0.1.2 searched for every normal sample: tens of
+     * thousands of reads that made the audio drop out.) */
+    if (readable && !allow_search)
         return 0;
     /* No path leads anywhere for this one: let the logger look. */
     unsigned h = atomic_load_explicit(&g_qhead, memory_order_relaxed);
@@ -265,11 +288,9 @@ int disc_poll(uintptr_t image_lo, uintptr_t image_hi, int key_off, char *msg, si
     unsigned h = atomic_load_explicit(&g_qhead, memory_order_acquire);
     int learned = 0;
     g_polls++;
-    for (int i = 0; i < g_ntried;) /* forget old failures */
-        if (g_polls - g_tried[i].poll > RETRY_POLLS)
-            g_tried[i] = g_tried[--g_ntried];
-        else
-            i++;
+    for (int i = 0; i < g_ntried; i++) /* one retry after a while (not loaded yet?) */
+        if (g_tried[i].tries == 1 && g_polls - g_tried[i].poll > RETRY_POLLS)
+            g_tried[i].poll = 0, g_tried[i].tries = -g_tried[i].tries; /* marked: may retry */
     if (g_last_search && g_polls - g_last_search < g_search_every)
         return 0; /* the queue waits */
     while (t != h && !learned) {
@@ -277,12 +298,13 @@ int disc_poll(uintptr_t image_lo, uintptr_t image_hi, int key_off, char *msg, si
         atomic_store_explicit(&g_qtail, ++t, memory_order_release);
         uintptr_t sample = 0;
         disc_read(&sample, (uintptr_t)gen + (uintptr_t)key_off, sizeof sample);
-        uintptr_t key = (uintptr_t)gen ^ (sample * 0x9e3779b97f4a7c15ull);
-        int tried = 0;
+        uintptr_t key = sample ? sample : (uintptr_t)gen; /* a sample's frames do not change */
+        int tried = -1;
         for (int i = 0; i < g_ntried; i++)
-            tried |= g_tried[i].key == key;
-        if (tried)
-            continue;
+            if (g_tried[i].key == key)
+                tried = i;
+        if (tried >= 0 && g_tried[tried].tries > 0)
+            continue; /* searched, not due for a retry */
         disc_path_t d;
         int reads = 0;
         g_last_search = g_polls;
@@ -299,11 +321,24 @@ int disc_poll(uintptr_t image_lo, uintptr_t image_hi, int key_off, char *msg, si
             snprintf(msg, cap, "FM carrier frames found: %s (%d reads)", where, reads);
             learned = 1;
             g_ntried = 0; /* new knowledge: generators may be retried */
+        } else if (tried >= 0) {
+            g_tried[tried].tries = 1 - g_tried[tried].tries; /* -1 -> 2: final */
+            g_tried[tried].poll = g_polls;
         } else if (g_ntried < (int)(sizeof g_tried / sizeof *g_tried)) {
-            g_tried[g_ntried].key = key; /* a normal sample, or out of reach */
-            g_tried[g_ntried++].poll = g_polls;
+            g_tried[g_ntried].key = key; /* a normal sample, or not loaded yet */
+            g_tried[g_ntried].poll = g_polls;
+            g_tried[g_ntried++].tries = 1;
         }
         break; /* one search per turn */
     }
     return learned;
+}
+
+void disc_reset(void)
+{
+    atomic_store(&g_npaths, 0);
+    atomic_store(&g_qhead, 0);
+    atomic_store(&g_qtail, 0);
+    g_ntried = 0;
+    g_last_search = 0;
 }

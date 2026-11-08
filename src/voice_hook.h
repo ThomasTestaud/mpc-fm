@@ -36,6 +36,20 @@ extern vh_stats_t vh_stats;
 /* FM voices now. */
 int vh_active_voices(void);
 
+/* One note start, for the logs (written by the audio thread). */
+enum { VH_KIND_UNKNOWN, VH_KIND_MEMORY, VH_KIND_DISK, VH_KIND_RECORDED };
+typedef struct {
+    uintptr_t sample;      /* the Sample object */
+    int kind;              /* VH_KIND_*: where the sample's audio comes from */
+    uint32_t vt_off;       /* its provider's vtable (app offset) */
+    int fm;                /* 1: played as FM */
+    int algorithm;         /* if FM */
+    unsigned char nib[8];  /* low nibbles of the first frames read (0xff: none) */
+} vh_note_t;
+/* Note starts since *cursor (at most max); moves the cursor. */
+int vh_notes_since(uint64_t *cursor, vh_note_t *out, int max);
+const char *vh_kind_name(int kind);
+
 /* 1 while the thread runs our hook code, 2 while it runs the stock method
  * called from our hook, else 0 (for crash reports). */
 extern __thread int vh_in_hook __attribute__((tls_model("initial-exec")));
@@ -44,6 +58,9 @@ typedef uintptr_t (*vh_fn)(void *, uintptr_t, uintptr_t, uintptr_t, uintptr_t, u
                            uintptr_t, uintptr_t);
 
 #ifdef MPCFM_TEST
+/* Tests: fake provider vtables (the first word of a fake provider). */
+#define VH_TEST_VT_MEMORY 0x5a5a0010u
+#define VH_TEST_VT_DISK 0x5a5a0020u
 /* Tests: use these as the stock methods and call the wrappers directly. */
 void vh_test_setup(vh_fn start, vh_fn stop, vh_fn render, uintptr_t plain_mono);
 uintptr_t vh_test_start(void *gen);

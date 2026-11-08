@@ -1,6 +1,6 @@
 #ifndef MPCFM_VERSION_H
 #define MPCFM_VERSION_H
 
-#define MPCFM_VERSION "0.1.3"
+#define MPCFM_VERSION "0.1.4"
 
 #endif

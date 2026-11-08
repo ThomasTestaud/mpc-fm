@@ -51,6 +51,7 @@
 #define OFF_DELAY 192
 #define OFF_SAMPLE 240
 #define OFF_POS 368
+#define OFF_PROVIDER 368 /* in the Sample object: its audio provider */
 
 #define VT_ENTRIES 16
 #define SLOT_RENDER 0
@@ -71,6 +72,7 @@ typedef struct {
     uintptr_t vtable, typeinfo, method[VT_ENTRIES], plain_mono;
     uintptr_t image_size;
     disc_path_t frames_path; /* where a sample's first frames are, from the generator */
+    uintptr_t vt_memory[3], vt_disk[3], vt_recorded[3]; /* provider vtables (and subobjects) */
 } layout_t;
 
 static const layout_t LAYOUTS[] = {
@@ -80,8 +82,75 @@ static const layout_t LAYOUTS[] = {
      0x2216f70, 0x7300000,
      /* learned the same way in two device runs (v0.1.1, v0.1.2): the
       * generator's reader points at frame 0 at note start */
-     {2, {528, 0}, 0, FM_FMT_F32}},
+     {2, {528, 0}, 0, FM_FMT_F32},
+     {0x6dbd5f0}, {0x6dbd458, 0x6dbd4f0, 0x6dbd510}, {0x6dbd668, 0x6dbd6f0}},
 };
+static const layout_t *g_layout;
+static uintptr_t g_base;
+
+/* ---- note starts, for the logs ---- */
+#define NOTES 64
+static vh_note_t g_notes[NOTES];
+static uint64_t g_notes_head;
+
+const char *vh_kind_name(int kind)
+{
+    switch (kind) {
+    case VH_KIND_MEMORY: return "MemorySample";
+    case VH_KIND_DISK: return "DiskSample";
+    case VH_KIND_RECORDED: return "RecordedSample";
+    default: return "unknown provider";
+    }
+}
+
+int vh_notes_since(uint64_t *cursor, vh_note_t *out, int max)
+{
+    uint64_t head = __atomic_load_n(&g_notes_head, __ATOMIC_ACQUIRE);
+    if (head - *cursor > NOTES)
+        *cursor = head - NOTES;
+    int n = 0;
+    while (*cursor < head && n < max)
+        out[n++] = g_notes[(*cursor)++ % NOTES];
+    return n;
+}
+
+static int in3(uintptr_t v, const uintptr_t t[3])
+{
+    for (int i = 0; i < 3; i++)
+        if (t[i] && v == g_base + t[i])
+            return 1;
+    return 0;
+}
+
+static int user_ptr(uintptr_t v) { return v >= 0x10000 && v < (1ull << 48) && !(v & 7); }
+
+/* Where does this generator's sample get its audio? Plain loads: the
+ * stock start method has just used this same chain (gen+240 -> Sample,
+ * Sample+368 -> provider), so it is valid; still checked for null. */
+static int provider_kind(void *gen, uintptr_t *sample, uint32_t *vt_off)
+{
+    uintptr_t sm, prov, vt;
+    *sample = 0;
+    *vt_off = 0;
+    memcpy(&sm, (char *)gen + OFF_SAMPLE, 8);
+    if (!user_ptr(sm))
+        return VH_KIND_UNKNOWN;
+    *sample = sm;
+    memcpy(&prov, (char *)sm + OFF_PROVIDER, 8);
+    if (!user_ptr(prov))
+        return VH_KIND_UNKNOWN;
+    memcpy(&vt, (char *)prov, 8);
+    if (!g_layout)
+        return VH_KIND_UNKNOWN;
+    *vt_off = vt >= g_base && vt - g_base < 0xffffffffu ? (uint32_t)(vt - g_base) : 0;
+    if (in3(vt, g_layout->vt_memory))
+        return VH_KIND_MEMORY;
+    if (in3(vt, g_layout->vt_disk))
+        return VH_KIND_DISK;
+    if (in3(vt, g_layout->vt_recorded))
+        return VH_KIND_RECORDED;
+    return VH_KIND_UNKNOWN;
+}
 
 typedef struct {
     _Atomic(void *) owner; /* the DefaultSampleGenerator */
@@ -152,7 +221,15 @@ static void claim(void *gen)
     uint64_t t0 = now_ns();
     fm_patch patch;
     int root = 60;
-    int found = disc_lookup(gen, &patch, &root);
+    vh_note_t note;
+    memset(&note, 0, sizeof note);
+    note.kind = provider_kind(gen, &note.sample, &note.vt_off);
+    /* The built-in path covers samples in RAM; others may need a search. */
+    int found = disc_lookup(gen, &patch, &root, note.kind != VH_KIND_MEMORY, note.nib);
+    note.fm = found;
+    note.algorithm = found ? patch.algorithm + 1 : 0;
+    uint64_t slot = __atomic_fetch_add(&g_notes_head, 1, __ATOMIC_ACQ_REL);
+    g_notes[slot % NOTES] = note; /* diagnostics: a torn entry is harmless */
     uint64_t dt = now_ns() - t0;
     if (dt > atomic_load_explicit(&vh_stats.lookup_max_ns, memory_order_relaxed))
         atomic_store_explicit(&vh_stats.lookup_max_ns, dt, memory_order_relaxed);
@@ -419,6 +496,8 @@ int vh_install(uintptr_t base, const char *build_id, char *msg, size_t cap)
     g_plain_mono = base + L->plain_mono;
     g_image_lo = base;
     g_image_hi = base + L->image_size;
+    g_layout = L;
+    g_base = base;
     disc_set_first_hop(first_hop);
     disc_seed(&L->frames_path);
     __atomic_store_n(&vt[SLOT_RENDER], TRAMP_RENDER, __ATOMIC_RELEASE);
@@ -445,6 +524,10 @@ void vh_test_setup(vh_fn start, vh_fn stop, vh_fn render, uintptr_t plain_mono)
     g_image_lo = g_image_hi = 0;
     disc_set_first_hop(first_hop);
     disc_set_throttle(0);
+    disc_reset();
+    static layout_t test_layout = {.vt_memory = {VH_TEST_VT_MEMORY}, .vt_disk = {VH_TEST_VT_DISK}};
+    g_layout = &test_layout;
+    g_base = 0;
     memset(g_slots, 0, sizeof g_slots);
     memset(&vh_stats, 0, sizeof vh_stats);
     vh_active = 0;

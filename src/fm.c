@@ -434,6 +434,59 @@ static void status_threads(sbuf *b)
 
 static uint64_t g_prev_blocks, g_prev_ns;
 
+/* Samples seen at note starts (logger thread). */
+typedef struct {
+    uintptr_t sample;
+    int kind, fm_now;
+    uint32_t vt_off;
+    unsigned starts, fm;
+    int algorithm;
+    unsigned char nib[8];
+} sample_row;
+static sample_row g_samples[24];
+static int g_nsamples;
+static uint64_t g_note_cursor;
+
+static void note_rows(void)
+{
+    vh_note_t notes[64];
+    int n = vh_notes_since(&g_note_cursor, notes, 64);
+    for (int i = 0; i < n; i++) {
+        const vh_note_t *t = &notes[i];
+        sample_row *r = NULL;
+        for (int k = 0; k < g_nsamples; k++)
+            if (g_samples[k].sample == t->sample)
+                r = &g_samples[k];
+        if (!r && g_nsamples < (int)(sizeof g_samples / sizeof *g_samples)) {
+            r = &g_samples[g_nsamples++];
+            memset(r, 0, sizeof *r);
+            r->sample = t->sample;
+            r->kind = t->kind;
+            r->vt_off = t->vt_off;
+            r->fm_now = -1;
+        }
+        if (!r)
+            continue;
+        r->starts++;
+        r->fm += t->fm != 0;
+        memcpy(r->nib, t->nib, 8);
+        if (t->fm)
+            r->algorithm = t->algorithm;
+        if (r->fm_now != t->fm) { /* first start, or it changed: tell */
+            char nb[40] = "";
+            for (int k = 0; k < 8; k++)
+                snprintf(nb + strlen(nb), sizeof nb - strlen(nb), " %d", t->nib[k] == 0xff ? -1 : t->nib[k]);
+            if (t->fm)
+                event("sample %#lx (%s, vtable app+%#x): live FM, algorithm %d",
+                      (unsigned long)t->sample, vh_kind_name(t->kind), t->vt_off, t->algorithm);
+            else
+                event("sample %#lx (%s, vtable app+%#x): plays as a sample; first nibbles%s",
+                      (unsigned long)t->sample, vh_kind_name(t->kind), t->vt_off, nb);
+            r->fm_now = t->fm;
+        }
+    }
+}
+
 static void status_fm(sbuf *b)
 {
     sb_printf(b, "--- FM voices ---\nhooks: %s\n", g_hook_msg);
@@ -460,6 +513,19 @@ static void status_fm(sbuf *b)
               (double)atomic_load(&vh_stats.fm_max_ns) / 1e3,
               atomic_load(&vh_stats.last_ratio_milli) / 1000.0, atomic_load(&vh_stats.last_root),
               (double)atomic_load(&vh_stats.lookup_max_ns) / 1e3);
+    sb_printf(b, "samples played (provider, starts, as FM, first nibbles; a carrier: 13 4 0 5 6 4 13 4):\n");
+    for (int i = 0; i < g_nsamples; i++) {
+        const sample_row *r = &g_samples[i];
+        sb_printf(b, "  %#lx %-14s starts %u FM %u%s", (unsigned long)r->sample, vh_kind_name(r->kind),
+                  r->starts, r->fm, r->fm ? " (algorithm " : "");
+        if (r->fm)
+            sb_printf(b, "%d)", r->algorithm);
+        sb_printf(b, " |");
+        for (int k = 0; k < 8; k++)
+            sb_printf(b, " %d", r->nib[k] == 0xff ? -1 : r->nib[k]);
+        sb_printf(b, "\n");
+    }
+    sb_printf(b, "searches run: %u\n", disc_searches());
     disc_path_t paths[4];
     int n = disc_paths(paths, 4);
     if (!n)
@@ -541,6 +607,7 @@ static void *logger_main(void *arg)
         }
         if (g_hooks_on) {
             char m[256];
+            note_rows();
             if (vh_poll(m, sizeof m)) {
                 event("%s", m);
                 if (g_logdir[0]) /* show it on the card at once */

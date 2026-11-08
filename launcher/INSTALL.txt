@@ -5,7 +5,7 @@ mpc-fm is a separate project. It does not contain SampQOL OS and does not
 change any SampQOL file. Get SampQOL OS only from its official page:
 https://github.com/snarebes/SampQOL-OS/releases
 
-Version 0.1.3: FM pads (prototype). The files in MPC-FM-Samples are
+Version 0.1.4: FM pads (prototype). The files in MPC-FM-Samples are
 "FM carriers": each one is a recording of an FM sound with the FM patch
 hidden inside it. Load one on a pad: with mpc-fm, the pad plays the live FM
 engine; without mpc-fm (or on another MPC) it plays the recording.
@@ -38,8 +38,12 @@ FM pads
 3. Play it. Keys mode plays it chromatically (root C3). Tune, filter,
    envelopes, Pad EQ, inserts, mixer and export work as for any pad.
 Is it live FM or the recording? Load FM-LiveCheck-C3.wav on a pad: its
-recording is a plain sine, the patch hidden in it is a bell. A bell sound
-means live FM; a plain sine means the recording (FM not active).
+recording is a plain sine, the patch hidden in it is a bell. Play the PAD:
+a bell sound means live FM; a plain sine means the recording. (The preview
+in SAMPLE SELECT always plays the recording: it does not go through a pad.)
+logs/mpcfm-status.txt lists each sample played, where the MPC keeps it
+(MemorySample: in RAM, DiskSample: streamed from the card) and if it
+played as FM.
 To check that it is live FM, not the recording: logs/mpcfm-status.txt,
 section "FM voices": "FM notes" counts the notes played by the engine, and
 "carrier frames path" shows what was learned.

@@ -26,8 +26,11 @@ typedef struct {
 } disc_path_t;
 
 /* Audio thread, at a note start. 1: an FM carrier, *p and *root set.
- * 0: not a carrier (or no path known yet: then queued for the logger). */
-int disc_lookup(void *gen, fm_patch *p, int *root);
+ * 0: not a carrier. Queued for a search by the logger when no known path
+ * leads to frames, or when allow_search (no header found on the known
+ * paths, for samples the paths may not cover). nib: the low nibbles of
+ * the first 8 frames on the first readable path (or 0xff: unreadable). */
+int disc_lookup(void *gen, fm_patch *p, int *root, int allow_search, unsigned char nib[8]);
 
 /* Logger thread: search the queued generators. key_off: offset of the
  * generator's sample object pointer (to tell its samples apart). Returns 1
@@ -50,6 +53,9 @@ void disc_set_first_hop(disc_first_hop_fn fn);
 
 /* Safe memory read (process_vm_readv). 0 on success. */
 int disc_read(void *dst, uintptr_t addr, size_t n);
+
+/* Tests: forget all paths, the queue and past searches. */
+void disc_reset(void);
 
 /* Tests: polls between two searches (default 5; 0: no limit). */
 void disc_set_throttle(unsigned polls);
