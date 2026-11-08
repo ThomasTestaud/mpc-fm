@@ -5,7 +5,8 @@ mpc-fm is a separate project. It does not contain SampQOL OS and does not
 change any SampQOL file. Get SampQOL OS only from its official page:
 https://github.com/snarebes/SampQOL-OS/releases
 
-Version 0.1.7: FM pads (prototype). The files in MPC-FM-Samples are
+Version 0.2.0: FM pads, and the FM page to edit them on the MPC
+(prototype). The files in MPC-FM-Samples are
 "FM carriers": each one is a recording of an FM sound with the FM patch
 hidden inside it. Load one on a pad: with mpc-fm, the pad plays the live FM
 engine; without mpc-fm (or on another MPC) it plays the recording.
@@ -26,7 +27,7 @@ Install
    +-- sampqol-autorun/      the official SampQOL "autorun" folder, unchanged
 
 4. Put the card in the MPC and switch it on. SampQOL OS starts as usual.
-   Under the SampQOL logo, a line shows "mpc-fm 0.0.1  FM on", or
+   Under the SampQOL logo, a line shows "mpc-fm 0.2.0  FM on", or
    "FM off: <reason>" (disabled, files changed, crash guard, ...).
    No SampQOL splash at all: SampQOL was not found, the MPC starts stock.
    See logs/mpcfm-launch.log.
@@ -48,6 +49,42 @@ To check that it is live FM, not the recording: logs/mpcfm-status.txt,
 section "FM voices": "FM notes" counts the notes played by the engine, and
 "carrier frames path" shows what was learned.
 
+FM page: edit the sound on the MPC
+----------------------------------
+1. Play an FM pad (a pad with an FM-... file).
+2. Hold SHIFT and press NOTE REPEAT: the FM page opens. It edits the FM
+   sound of the last FM pad you hit. Hit another FM pad: the page follows.
+3. B1, B2, B3 (above the screen) pick the page; K1, K2, K3 change the
+   values. The pads still play, so you hear each change at once, also on
+   notes that are still sounding.
+
+   B1 PATCH        K1 Algorithm   K2 Feedback   K3 Volume
+   B2 OPERATOR n   K1 Ratio       K2 Level      K3 Detune
+                   SHIFT + K1: Fixed freq (for drums; fully left = off)
+   B3 ENVELOPE n   K1 Attack      K2 Decay      K3 Sustain
+
+   Press B2 or B3 again, turn the ENCODER, or press - / +: the next
+   operator (on PATCH, the encoder steps the algorithm). The picture
+   shows the algorithm: blue boxes are heard (carriers), the others
+   modulate them; the bar in each box is its Level.
+   The knobs move the value from where it is (as "Scaled" takeover): no
+   jump when you change page.
+4. Close: SHIFT + NOTE REPEAT again, or press any other button (SAMPLE,
+   SEQ, ...: it then does its normal job). PLAY, STOP, REC, the fader and
+   MAIN VOLUME work while the page is open.
+
+Your edits are kept: about 2 s after the last change, when you close the
+page, and when you switch pads, they are saved on the card as
+MPC-FM-Patches/<sample name>.txt. From then on, every sample with that name
+plays the edited sound (also after a reboot, and in saved projects). The
+FM file itself is not changed. To go back to the original sound, delete
+that .txt file. The .txt files are plain text: you can read or change them
+on a computer.
+The first note of an edited sample after a start-up can still play the
+original sound; the next notes play the edited one.
+Turn the page off (FM pads keep working): create a file "NO_PAGE" in
+autorun/mpcfm/.
+
 Limits of this prototype:
 - The FM envelopes do not get the note-off yet: the pad's amp envelope
   (Attack/Decay, One Shot or Note On) shapes the end of the note.
@@ -56,14 +93,17 @@ Limits of this prototype:
   for a sample in One Shot mode.
 - Saving a project: the MPC rewrites its copy of the sample and the
   hidden patch is lost. mpc-fm then takes the patch from the original
-  file of the same name on the card (MPC-FM-Samples, or MPC-Sample/Samples):
-  keep the FM files there, and do not rename them.
+  file of the same name on the card (MPC-FM-Samples, or MPC-Sample/Samples),
+  or from MPC-FM-Patches if you edited it: keep the FM files there, and do
+  not rename them.
+- Release and Velocity are not on the page yet: the FM sound does not get
+  the note-off or the velocity yet (see above).
 - Editing the file in the MPC (trim, normalize, chop) changes the sound of
   the recording only; Warp / time-stretch on the pad plays the recording.
 
 Results
 -------
-autorun/logs/mpcfm-status.txt   audio timing, threads, CPU clocks (every 10 s)
+autorun/logs/mpcfm-status.txt   audio timing, threads, CPU clocks, FM page (every 10 s)
 autorun/logs/mpcfm-events.log   start, xruns, late audio blocks
 autorun/logs/mpcfm-launch.log   was FM added to the app, and why not
 With root SSH: /tmp/mpcfm/status.txt is updated every second.

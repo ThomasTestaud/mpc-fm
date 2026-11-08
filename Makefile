@@ -31,9 +31,13 @@ ENGINE_FLAGS = -O3 -fno-math-errno -ffp-contract=fast -Isrc/fm
 
 ENGINE_SRC = src/fm/fm_engine.c src/fm/fm_presets.c src/fm/fm_carrier.c
 ENGINE_HDR = src/fm/fm_engine.h src/fm/fm_presets.h src/fm/fm_carrier.h
-FM_SRC = src/fm.c src/alsa_probe.c src/voice_hook.c src/discover.c src/crash.c src/sampleinfo.c src/fm/fm_engine.c src/fm/fm_carrier.c
+UI_SRC = src/ui/ui.c src/ui/fm_page.c src/ui/surface.c src/ui/surface_filter.c src/ui/display.c
+UI_HDR = src/ui/ui.h src/ui/fm_page.h src/ui/surface.h src/ui/display.h src/ui/fonts.h
+FM_SRC = src/fm.c src/alsa_probe.c src/voice_hook.c src/discover.c src/crash.c src/sampleinfo.c \
+	src/patchfile.c src/fm/fm_engine.c src/fm/fm_carrier.c $(UI_SRC)
 ARM_ASM = src/tramp_hooks.S src/tramp_aarch64.inc
-FM_HDR = src/probe.h src/version.h src/voice_hook.h src/discover.h src/crash.h src/sampleinfo.h $(ENGINE_HDR)
+FM_HDR = src/probe.h src/version.h src/voice_hook.h src/discover.h src/crash.h src/sampleinfo.h \
+	src/patchfile.h $(ENGINE_HDR) $(UI_HDR)
 # fm.so: the engine runs in it, so the engine flags; BTI/PAC landing pads
 # like the stock app (no-ops on the A55).
 FM_FLAGS = $(ENGINE_FLAGS) -Isrc
@@ -81,17 +85,32 @@ dist: arm check-arm
 
 # ---- host build and tests ----
 host: $(HOST)/fm.so $(HOST)/setarch $(HOST)/fake_app $(HOST)/test_fm $(HOST)/test_hook \
-	$(HOST)/fmbench $(HOST)/fmrender
+	$(HOST)/test_page $(HOST)/test_ui $(HOST)/test_uiloop $(HOST)/fmbench $(HOST)/fmrender
 
 $(HOST)/fm.so: $(FM_SRC) $(FM_HDR)
 	@mkdir -p $(@D)
 	$(CC_HOST) $(CFLAGS) $(SO_FLAGS) $(FM_FLAGS) -DMPCFM_TARGET_EXE='"$(abspath $(HOST)/fake_app)"' \
 		-o $@ $(FM_SRC) -ldl -lpthread -lm
 
-$(HOST)/test_hook: tests/test_hook.c src/voice_hook.c src/voice_hook.h src/discover.c src/discover.h src/sampleinfo.c src/sampleinfo.h $(ENGINE_SRC) $(ENGINE_HDR)
+HOOK_SRC = src/voice_hook.c src/discover.c src/sampleinfo.c src/patchfile.c
+$(HOST)/test_hook: tests/test_hook.c $(HOOK_SRC) src/voice_hook.h src/discover.h src/sampleinfo.h src/patchfile.h $(ENGINE_SRC) $(ENGINE_HDR)
 	@mkdir -p $(@D)
 	$(CC_HOST) $(CFLAGS) -DMPCFM_TEST $(FM_FLAGS) -o $@ tests/test_hook.c \
-		src/voice_hook.c src/discover.c src/sampleinfo.c $(ENGINE_SRC) -lm
+		$(HOOK_SRC) $(ENGINE_SRC) -lm -lpthread
+
+# The FM page: model and pictures (build/host/page-*.ppm), then the
+# surface filter, the screen swap and the patch files.
+$(HOST)/test_page: tests/test_page.c src/ui/fm_page.c src/ui/fm_page.h src/ui/fonts.h $(ENGINE_SRC) $(ENGINE_HDR)
+	@mkdir -p $(@D)
+	$(CC_HOST) $(CFLAGS) $(FM_FLAGS) -o $@ tests/test_page.c src/ui/fm_page.c $(ENGINE_SRC) -lm
+$(HOST)/test_ui: tests/test_ui.c src/ui/surface_filter.c src/ui/display.c src/ui/surface.h src/ui/display.h $(HOOK_SRC) src/sampleinfo.h src/patchfile.h $(ENGINE_SRC) $(ENGINE_HDR)
+	@mkdir -p $(@D)
+	$(CC_HOST) $(CFLAGS) -DMPCFM_TEST $(FM_FLAGS) -o $@ tests/test_ui.c src/ui/surface_filter.c \
+		src/ui/display.c src/discover.c src/sampleinfo.c src/patchfile.c $(ENGINE_SRC) -ldl -lpthread -lm
+$(HOST)/test_uiloop: tests/test_uiloop.c $(UI_SRC) $(UI_HDR) $(HOOK_SRC) src/voice_hook.h src/sampleinfo.h src/patchfile.h $(ENGINE_SRC) $(ENGINE_HDR)
+	@mkdir -p $(@D)
+	$(CC_HOST) $(CFLAGS) -DMPCFM_TEST $(FM_FLAGS) -o $@ tests/test_uiloop.c $(UI_SRC) \
+		$(HOOK_SRC) $(ENGINE_SRC) -ldl -lpthread -lm
 
 $(HOST)/setarch: $(SHIM_SRC) $(SHIM_HDR)
 	@mkdir -p $(@D)
@@ -119,6 +138,9 @@ $(HOST)/fmrender: tools/fmrender.c $(ENGINE_SRC) $(ENGINE_HDR)
 check: host
 	$(HOST)/test_fm
 	$(HOST)/test_hook
+	$(HOST)/test_page $(HOST)
+	$(HOST)/test_ui
+	$(HOST)/test_uiloop
 	sh tests/test_launcher.sh $(HOST)/setarch
 	sh tests/test_autorun.sh $(HOST)
 	sh tests/test_probe.sh $(HOST)

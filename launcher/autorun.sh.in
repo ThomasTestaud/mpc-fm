@@ -85,6 +85,13 @@ if [ -e "$DIR/mpcfm/TEST_SILENT_FM" ]; then
     log "TEST_SILENT_FM: FM voices will play silence"
 fi
 
+# The FM page (SHIFT + NOTE REPEAT) off: file mpcfm/NO_PAGE. FM pads still play.
+if [ -e "$DIR/mpcfm/NO_PAGE" ]; then
+    MPCFM_PAGE=0
+    export MPCFM_PAGE
+    log "NO_PAGE: the FM page is off"
+fi
+
 if [ "$SHIM" = 1 ]; then
     MPCFM_BIN="$RUN/bin"
     MPCFM_STATE="$RUN"

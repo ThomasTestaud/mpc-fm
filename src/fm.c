@@ -1,7 +1,7 @@
 /* mpc-fm: FM synth add-on for the Akai MPC Sample, loaded next to SampQOL OS.
  *
- * Phase 0 build: no sound yet. It measures the real audio budget on the
- * device and writes it to a status file once per second:
+ * FM pads (voice_hook.c), the FM page on the MPC's own controls (ui/), and
+ * a probe of the real audio budget, written to a status file every second:
  *   - timing of the stock app's ALSA calls (alsa_probe.c): block period,
  *     processing time per block, xruns;
  *   - CPU use, core, scheduling policy and priority of every app thread;
@@ -41,6 +41,7 @@
 #include "crash.h"
 #include "discover.h"
 #include "voice_hook.h"
+#include "ui/ui.h"
 
 #ifndef MPCFM_TARGET_EXE
 #define MPCFM_TARGET_EXE "/usr/bin/MPC Sample"
@@ -60,6 +61,7 @@ static int g_qol_loaded;
 static uintptr_t g_app_base;
 static char g_hook_msg[160] = "not tried";
 static int g_hooks_on;
+static int g_page_on;
 
 /* Stock app builds we know (code hooks only run on these). */
 static const struct {
@@ -165,6 +167,8 @@ static void event(const char *fmt, ...)
     if (g_logdir[0])
         append_capped(g_logdir, "mpcfm-events.log", line);
 }
+
+static void ui_log(const char *msg) { event("%s", msg); }
 
 /* ---- loaded objects: build-id of the stock app, is SampQOL loaded ---- */
 
@@ -470,7 +474,8 @@ static void scan_library(void)
     const char *dirs[2] = {a, b};
     int n = library_scan(dirs, 2);
     g_lib_scanned_tick = g_tick_now;
-    event("patch library: %d FM files on the card", n);
+    event("patch library: %d FM files on the card, %d edited patches (MPC-FM-Patches)", n,
+          library_edit_count());
 }
 
 /* What did the MPC change in its copy? (once per file, for the logs) */
@@ -506,7 +511,7 @@ static void compare_copy(const char *copy, const char *orig, const char *name)
           eo > 0 ? sqrt(ea / eo) : 0.0, maxd);
 }
 
-static void inspect_sample(uintptr_t sample, int kind)
+static void inspect_sample(uintptr_t sample, int kind, int fm_now)
 {
     uintptr_t prov = 0;
     if (disc_read(&prov, sample + 368, 8) != 0)
@@ -519,7 +524,7 @@ static void inspect_sample(uintptr_t sample, int kind)
             g_inspected[i].name_ptr == l.ptr)
             return; /* done already */
     int fm_named = !strncmp(l.base, "FM-", 3);
-    if (!fm_named && kind != VH_KIND_DISK)
+    if (!fm_named && kind != VH_KIND_DISK && !fm_now)
         return; /* a normal sample in RAM: nothing to read */
     if (g_ninspected < 64) {
         g_inspected[g_ninspected].sample = sample;
@@ -528,6 +533,16 @@ static void inspect_sample(uintptr_t sample, int kind)
     }
     fm_patch p;
     int root = 60;
+    char orig[256];
+    if (library_find(l.base, &p, &root, orig, sizeof orig) == 2) { /* edited on the FM page */
+        vh_disk_add(sample, prov, l.i, l.obj, l.k, l.ptr, &p, root);
+        const char *ob = strrchr(orig, '/');
+        event("sample \"%s\" (%s): edited patch %s, live from the next note", l.base,
+              vh_kind_name(kind), ob ? ob + 1 : orig);
+        return;
+    }
+    if (fm_now)
+        return; /* plays its own patch: nothing else to do */
     int r = strchr(l.path, '/') ? carrier_from_file(l.path, &p, &root) : -1;
     if (r == 1) {
         vh_disk_add(sample, prov, l.i, l.obj, l.k, l.ptr, &p, root);
@@ -537,7 +552,6 @@ static void inspect_sample(uintptr_t sample, int kind)
     }
     if (!fm_named)
         return;
-    char orig[256];
     int found = library_find(l.base, &p, &root, orig, sizeof orig);
     if (!found && g_tick_now - g_lib_scanned_tick > 30) { /* a new file on the card? */
         scan_library();
@@ -562,7 +576,13 @@ static uint64_t g_note_cursor;
 
 static void note_rows(void)
 {
-    vh_note_t notes[64];
+    static unsigned edit_gen;
+    unsigned gen = library_edit_generation();
+    if (gen != edit_gen) { /* an edit was saved: look at every sample again */
+        edit_gen = gen;
+        g_ninspected = 0;
+    }
+    static vh_note_t notes[64];
     int n = vh_notes_since(&g_note_cursor, notes, 64);
     for (int i = 0; i < n; i++) {
         const vh_note_t *t = &notes[i];
@@ -581,8 +601,7 @@ static void note_rows(void)
         }
         if (!r)
             continue;
-        if (!t->fm)
-            inspect_sample(t->sample, t->kind);
+        inspect_sample(t->sample, t->kind, t->fm);
         r->starts++;
         r->fm += t->fm != 0;
         memcpy(r->nib, t->nib, 8);
@@ -689,6 +708,13 @@ static void build_status(sbuf *b, long up_s)
     scan_threads();
     status_audio(b);
     status_fm(b);
+    if (g_page_on) {
+        char u[2048];
+        ui_status(u, sizeof u);
+        sb_printf(b, "--- FM page ---\n%s", u);
+    } else if (g_hooks_on) {
+        sb_printf(b, "--- FM page ---\noff (file mpcfm/NO_PAGE)\n");
+    }
     status_threads(b);
 }
 
@@ -781,6 +807,18 @@ __attribute__((constructor)) static void mpcfm_init(void)
         snprintf(g_hook_msg, sizeof g_hook_msg, "off: unknown app build");
     else
         g_hooks_on = vh_install(g_app_base, g_buildid, g_hook_msg, sizeof g_hook_msg);
+
+    /* The FM page (SHIFT + NOTE REPEAT): needs the FM voices. */
+    if (g_card[0]) {
+        char d[300];
+        snprintf(d, sizeof d, "%s/MPC-FM-Patches", g_card);
+        library_set_edit_dir(d);
+    }
+    v = getenv("MPCFM_PAGE");
+    if (g_hooks_on && !(v && strcmp(v, "0") == 0)) {
+        g_page_on = 1;
+        ui_start(ui_log);
+    }
 
     pthread_attr_t a;
     pthread_t th;

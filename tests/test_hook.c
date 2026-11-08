@@ -175,6 +175,54 @@ int main(void)
     for (int i = 0; i < 600 * N; i++) d = fmax(d, fabs(out[i] - 0.7f * ref[i]));
     CHECK(d < 1e-6, "output = FM engine x stock gain (diff %.1e)", d);
 
+    /* 3b. the note ring tells the FM page what played, with its patch */
+    {
+        static vh_note_t nt[64];
+        uint64_t cur = 0;
+        int nn = vh_notes_since(&cur, nt, 64), seen = 0;
+        for (int i = 0; i < nn; i++)
+            seen |= nt[i].fm && nt[i].sample == (uintptr_t)sample && nt[i].patch.algorithm == ep.algorithm &&
+                    nt[i].patch.op[1].ratio == ep.op[1].ratio && nt[i].t_ns > 0;
+        CHECK(seen, "note ring: the FM note with its sample, time and patch (%d notes)", nn);
+    }
+
+    /* 3c. live edit: a sounding note follows the edit patch at once */
+    new_gen(&g, 0.7f);
+    vh_test_start(&g);
+    play(&g, out, 50);
+    fm_patch ed = ep;
+    vh_edit_begin((uintptr_t)sample, &ed);
+    play(&g, out, 50);
+    float lv = 0;
+    for (int i = 0; i < 50 * N; i++) lv = fmaxf(lv, fabsf(out[i]));
+    for (int i = 0; i < FM_OPS; i++) vh_edit_patch()->op[i].level = 0.0f; /* the page turns all down */
+    play(&g, out, 4);
+    float after = 0;
+    for (int i = 2 * N; i < 4 * N; i++) after = fmaxf(after, fabsf(out[i]));
+    CHECK(lv > 0.01f && after < 1e-6f, "edit heard on the sounding note (peak %.3f -> %.1e)", lv, after);
+    vh_test_stop(&g);
+    new_gen(&g, 0.7f);
+    vh_test_start(&g);
+    {
+        static vh_note_t nt[64];
+        uint64_t cur = 0;
+        int nn = vh_notes_since(&cur, nt, 64);
+        CHECK(nn > 0 && nt[nn - 1].patch.op[0].level == 0.0f, "next note starts with the edited values");
+    }
+    play(&g, out, 4);
+    after = 0;
+    for (int i = 0; i < 4 * N; i++) after = fmaxf(after, fabsf(out[i]));
+    CHECK(after < 1e-6f, "and plays them");
+    vh_edit_end();
+    vh_test_stop(&g);
+    new_gen(&g, 0.7f);
+    vh_test_start(&g);
+    play(&g, out, 50);
+    lv = 0;
+    for (int i = 0; i < 50 * N; i++) lv = fmaxf(lv, fabsf(out[i]));
+    CHECK(lv > 0.01f, "edit session ended: its own patch again");
+    vh_test_stop(&g);
+
     /* 4. pitch follows how far the stock position moves */
     make_frames(1, "Sine", 69); /* root A4 */
     new_gen(&g, 1.0f);

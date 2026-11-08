@@ -1,5 +1,5 @@
 /* What a Sample object is: its file name, and if its WAV file is an FM
- * carrier. Logger thread only (safe reads, file I/O). See sampleinfo.h. */
+ * carrier, and the patch library. See sampleinfo.h. */
 #define _GNU_SOURCE
 #include "sampleinfo.h"
 
@@ -167,20 +167,57 @@ int carrier_from_file(const char *path, fm_patch *p, int *root)
     return fm_carrier_decode(f, FM_CARRIER_FRAMES, p, root) == 1;
 }
 
-/* ---- the library ---- */
+/* ---- the library ----
+ * The FM files on the card (by file name), and the patches edited on the
+ * FM page (text files, see patchfile.h), which come first. The logger
+ * thread scans; the logger and the FM page look up and save: one lock. */
 #include <dirent.h>
+#include <pthread.h>
 #include <sys/stat.h>
 
+#include "patchfile.h"
+
 #define LIB_MAX 512
-static struct {
-    char base[64]; /* file name without ".wav" */
+#define EDIT_MAX 256
+typedef struct {
+    char base[64]; /* file name without ".wav" / ".txt" */
     char path[256];
     fm_patch patch;
     int root;
-} g_lib[LIB_MAX];
-static int g_nlib;
+} lib_entry;
+static lib_entry g_lib[LIB_MAX], g_edit[EDIT_MAX];
+static int g_nlib, g_nedit;
+static char g_edit_dir[256];
+static pthread_mutex_t g_lib_lock = PTHREAD_MUTEX_INITIALIZER;
 
-int library_count(void) { return g_nlib; }
+static unsigned g_edit_gen;
+
+int library_count(void) { return __atomic_load_n(&g_nlib, __ATOMIC_RELAXED); }
+int library_edit_count(void) { return __atomic_load_n(&g_nedit, __ATOMIC_RELAXED); }
+unsigned library_edit_generation(void) { return __atomic_load_n(&g_edit_gen, __ATOMIC_ACQUIRE); }
+
+void library_set_edit_dir(const char *dir)
+{
+    pthread_mutex_lock(&g_lib_lock);
+    snprintf(g_edit_dir, sizeof g_edit_dir, "%s", dir ? dir : "");
+    pthread_mutex_unlock(&g_lib_lock);
+}
+
+static void copy_str(char *dst, size_t cap, const char *src, size_t n)
+{
+    if (n > cap - 1)
+        n = cap - 1;
+    memcpy(dst, src, n);
+    dst[n] = 0;
+}
+
+static int find_in(const lib_entry *t, int n, const char *base)
+{
+    for (int i = 0; i < n; i++)
+        if (!strcmp(t[i].base, base))
+            return i;
+    return -1;
+}
 
 static void scan_dir(const char *dir, int depth)
 {
@@ -208,33 +245,75 @@ static void scan_dir(const char *dir, int depth)
         int root = 60;
         if (carrier_from_file(path, &p, &root) != 1)
             continue;
-        size_t bl = len - 4 < sizeof g_lib[0].base - 1 ? len - 4 : sizeof g_lib[0].base - 1;
-        int dup = 0;
-        for (int i = 0; i < g_nlib; i++)
-            dup |= strlen(g_lib[i].base) == bl && !strncmp(g_lib[i].base, e->d_name, bl);
-        if (dup)
+        char base[64];
+        copy_str(base, sizeof base, e->d_name, len - 4);
+        if (find_in(g_lib, g_nlib, base) >= 0)
             continue; /* the first one found wins */
-        memcpy(g_lib[g_nlib].base, e->d_name, bl);
-        g_lib[g_nlib].base[bl] = 0;
-        size_t pl = strlen(path) < sizeof g_lib[0].path - 1 ? strlen(path) : sizeof g_lib[0].path - 1;
-        memcpy(g_lib[g_nlib].path, path, pl);
-        g_lib[g_nlib].path[pl] = 0;
-        g_lib[g_nlib].patch = p;
-        g_lib[g_nlib].root = root;
-        g_nlib++;
+        lib_entry *l = &g_lib[g_nlib++];
+        snprintf(l->base, sizeof l->base, "%s", base);
+        copy_str(l->path, sizeof l->path, path, strlen(path));
+        l->patch = p;
+        l->root = root;
+    }
+    closedir(d);
+}
+
+static int read_file(const char *path, char *out, size_t cap)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    ssize_t n = read(fd, out, cap - 1);
+    close(fd);
+    if (n < 0)
+        return -1;
+    out[n] = 0;
+    return (int)n;
+}
+
+static void scan_edits(void)
+{
+    g_nedit = 0;
+    if (!g_edit_dir[0])
+        return;
+    DIR *d = opendir(g_edit_dir);
+    if (!d)
+        return;
+    struct dirent *e;
+    while ((e = readdir(d)) && g_nedit < EDIT_MAX) {
+        size_t len = strlen(e->d_name);
+        if (e->d_name[0] == '.' || len < 5 || strcasecmp(e->d_name + len - 4, ".txt"))
+            continue;
+        char path[512], text[4096];
+        snprintf(path, sizeof path, "%s/%s", g_edit_dir, e->d_name);
+        fm_patch p;
+        int root = 60;
+        if (read_file(path, text, sizeof text) <= 0 || !pf_parse(text, &p, &root))
+            continue;
+        lib_entry *l = &g_edit[g_nedit++];
+        copy_str(l->base, sizeof l->base, e->d_name, len - 4);
+        copy_str(l->path, sizeof l->path, path, strlen(path));
+        l->patch = p;
+        l->root = root;
     }
     closedir(d);
 }
 
 int library_scan(const char *const *dirs, int ndirs)
 {
+    pthread_mutex_lock(&g_lib_lock);
     g_nlib = 0;
     for (int i = 0; i < ndirs; i++)
         scan_dir(dirs[i], 3);
-    return g_nlib;
+    scan_edits();
+    int n = g_nlib;
+    pthread_mutex_unlock(&g_lib_lock);
+    return n;
 }
 
-int library_find(const char *name, fm_patch *p, int *root, char *found, size_t cap)
+/* "FM-Bass-C3002.wav" -> "FM-Bass-C3002", then "FM-Bass-C3" (the MPC adds 3
+ * digits to copies), up to twice. Calls try() with each; stops at 1. */
+static int each_name(const char *name, int (*try)(const char *base, void *ctx), void *ctx)
 {
     char b[96];
     const char *slash = strrchr(name, '/');
@@ -242,20 +321,134 @@ int library_find(const char *name, fm_patch *p, int *root, char *found, size_t c
     size_t len = strlen(b);
     if (len > 4 && !strcasecmp(b + len - 4, ".wav"))
         b[len -= 4] = 0;
-    for (int strip = 0; strip <= 2; strip++) { /* "X", then X minus 3 digits, twice */
-        for (int i = 0; i < g_nlib; i++)
-            if (!strcmp(g_lib[i].base, b)) {
-                *p = g_lib[i].patch;
-                *root = g_lib[i].root;
-                if (found)
-                    snprintf(found, cap, "%s", g_lib[i].path);
-                return 1;
-            }
-        if (len < 4 || !(b[len - 1] >= '0' && b[len - 1] <= '9') || !(b[len - 2] >= '0' && b[len - 2] <= '9') ||
-            !(b[len - 3] >= '0' && b[len - 3] <= '9'))
+    for (int strip = 0; strip <= 2; strip++) {
+        if (try(b, ctx))
+            return 1;
+        if (len < 4 || !(b[len - 1] >= '0' && b[len - 1] <= '9') ||
+            !(b[len - 2] >= '0' && b[len - 2] <= '9') || !(b[len - 3] >= '0' && b[len - 3] <= '9'))
             break;
         b[len -= 3] = 0;
     }
     return 0;
 }
 
+typedef struct {
+    fm_patch *p;
+    int *root;
+    char *found;
+    size_t cap;
+    int edited;
+} find_ctx;
+
+static int try_find(const char *base, void *v)
+{
+    find_ctx *c = v;
+    int i = find_in(g_edit, g_nedit, base);
+    const lib_entry *l = i >= 0 ? &g_edit[i] : NULL;
+    if (!l) {
+        i = find_in(g_lib, g_nlib, base);
+        l = i >= 0 ? &g_lib[i] : NULL;
+    }
+    if (!l)
+        return 0;
+    c->edited = l >= g_edit && l < g_edit + EDIT_MAX;
+    *c->p = l->patch;
+    *c->root = l->root;
+    if (c->found)
+        snprintf(c->found, c->cap, "%s", l->path);
+    return 1;
+}
+
+int library_find(const char *name, fm_patch *p, int *root, char *found, size_t cap)
+{
+    find_ctx c = {p, root, found, cap, 0};
+    pthread_mutex_lock(&g_lib_lock);
+    int r = each_name(name, try_find, &c);
+    pthread_mutex_unlock(&g_lib_lock);
+    return r ? 1 + c.edited : 0;
+}
+
+typedef struct {
+    char *out;
+    size_t cap;
+} canon_ctx;
+
+static int try_canon(const char *base, void *v)
+{
+    canon_ctx *c = v;
+    if (find_in(g_edit, g_nedit, base) < 0 && find_in(g_lib, g_nlib, base) < 0)
+        return 0;
+    snprintf(c->out, c->cap, "%s", base);
+    return 1;
+}
+
+static int keep_first(const char *base, void *v)
+{
+    canon_ctx *c = v;
+    snprintf(c->out, c->cap, "%s", base);
+    return 1;
+}
+
+void library_canonical(const char *name, char *out, size_t cap)
+{
+    canon_ctx c = {out, cap};
+    pthread_mutex_lock(&g_lib_lock);
+    int r = each_name(name, try_canon, &c);
+    pthread_mutex_unlock(&g_lib_lock);
+    if (!r)
+        each_name(name, keep_first, &c);
+    for (char *s = out; *s; s++) /* a FAT file name */
+        if (strchr("/\\:*?\"<>|", *s) || (unsigned char)*s < 0x20)
+            *s = '_';
+}
+
+int library_save_edit(const char *name, const fm_patch *p, int root, char *msg, size_t cap)
+{
+    char base[64], text[2048], path[512], tmp[520];
+    library_canonical(name, base, sizeof base);
+    if (!base[0]) {
+        snprintf(msg, cap, "no name");
+        return 0;
+    }
+    size_t n = pf_format(p, root, base, text, sizeof text);
+    pthread_mutex_lock(&g_lib_lock);
+    int ok = 0;
+    if (!g_edit_dir[0]) {
+        snprintf(msg, cap, "no folder for edits");
+        goto out;
+    }
+    mkdir(g_edit_dir, 0755);
+    snprintf(path, sizeof path, "%s/%s.txt", g_edit_dir, base);
+    snprintf(tmp, sizeof tmp, "%s.new", path);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0 || !n) {
+        snprintf(msg, cap, "cannot write %s", path);
+        if (fd >= 0)
+            close(fd);
+        goto out;
+    }
+    ssize_t w = write(fd, text, n);
+    int sync_ok = fsync(fd) == 0;
+    close(fd);
+    if (w != (ssize_t)n || !sync_ok || rename(tmp, path) != 0) {
+        unlink(tmp);
+        snprintf(msg, cap, "cannot write %s", path);
+        goto out;
+    }
+    int i = find_in(g_edit, g_nedit, base);
+    if (i < 0 && g_nedit < EDIT_MAX)
+        i = g_nedit++;
+    if (i >= 0) {
+        lib_entry *l = &g_edit[i];
+        snprintf(l->base, sizeof l->base, "%s", base);
+        copy_str(l->path, sizeof l->path, path, strlen(path));
+        l->patch = *p;
+        l->root = root;
+    }
+    snprintf(msg, cap, "%s", path);
+    __atomic_add_fetch(&g_edit_gen, 1, __ATOMIC_RELEASE);
+    ok = 1;
+out:
+    pthread_mutex_unlock(&g_lib_lock);
+    return ok;
+}

@@ -7,6 +7,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "fm/fm_engine.h"
+
 /* Install the hooks on the app loaded at `base`, for the app build
  * `build_id`. 1: installed. 0: not (reason in msg). Call it before the app
  * starts its threads (from the constructor). */
@@ -51,19 +53,35 @@ int vh_disk_add(uintptr_t sample, uintptr_t provider, int name_i, uintptr_t name
                 uintptr_t name_ptr, const void *patch, int root);
 int vh_disk_count(void);
 
-/* One note start, for the logs (written by the audio thread). */
+/* One note start (written by the audio thread): for the logs, and for the
+ * FM page to know what was just played. */
 enum { VH_KIND_UNKNOWN, VH_KIND_MEMORY, VH_KIND_DISK, VH_KIND_RECORDED };
 typedef struct {
     uintptr_t sample;      /* the Sample object */
+    uintptr_t provider;    /* its audio provider */
+    uint64_t t_ns;         /* when (CLOCK_MONOTONIC) */
     int kind;              /* VH_KIND_*: where the sample's audio comes from */
     uint32_t vt_off;       /* its provider's vtable (app offset) */
     int fm;                /* 1: played as FM */
-    int algorithm;         /* if FM */
+    int algorithm;         /* if FM: 1..8 */
+    int root;              /* if FM: root note */
     unsigned char nib[8];  /* low nibbles of the first frames read (0xff: none) */
+    fm_patch patch;        /* if FM: the patch it plays */
 } vh_note_t;
-/* Note starts since *cursor (at most max); moves the cursor. */
+/* Note starts since *cursor (at most max); moves the cursor. Each reader
+ * keeps its own cursor. An entry being written is left for the next call. */
 int vh_notes_since(uint64_t *cursor, vh_note_t *out, int max);
 const char *vh_kind_name(int kind);
+
+/* ---- live edits (the FM page) ----
+ * While a Sample is being edited, every FM voice of it plays the shared
+ * edit patch, so a change is heard at once, also on notes that sound.
+ * Only one Sample at a time. The page writes the fields of
+ * vh_edit_patch() one by one, each with a value already in range. */
+void vh_edit_begin(uintptr_t sample, const fm_patch *p);
+void vh_edit_end(void);
+uintptr_t vh_edit_sample(void);
+fm_patch *vh_edit_patch(void);
 
 /* 1 while the thread runs our hook code, 2 while it runs the stock method
  * called from our hook, else 0 (for crash reports). */
@@ -79,6 +97,7 @@ typedef uintptr_t (*vh_fn)(void *, uintptr_t, uintptr_t, uintptr_t, uintptr_t, u
 /* Tests: use these as the stock methods and call the wrappers directly. */
 void vh_test_setup(vh_fn start, vh_fn stop, vh_fn render, uintptr_t plain_mono);
 uintptr_t vh_test_start(void *gen);
+void vh_test_note(const vh_note_t *n); /* as if the audio thread started it */
 uintptr_t vh_test_stop(void *gen);
 uintptr_t vh_test_render(void *gen, float *buf, int n);
 #endif

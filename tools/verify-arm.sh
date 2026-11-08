@@ -13,10 +13,21 @@ readelf -lW "$B/setarch" | grep -q 'INTERP' && fail "setarch is not static"
 max=$(readelf -VW "$B/fm.so" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
 [ "$(printf '%s\n2.30\n' "$max" | sort -V | tail -1)" = 2.30 ] || fail "fm.so needs GLIBC_$max"
 
-# Only the ALSA functions of the probe may be exported.
+# Only what we interpose may be exported: the ALSA PCM functions (probe),
+# the rawmidi input functions (surface) and the two DRM screen calls (page).
 exports=$(readelf --dyn-syms -W "$B/fm.so" | awk '$5=="GLOBAL" && $7!="UND" {print $8}' | sort)
 for s in $exports; do
-    case "$s" in snd_pcm_*) ;; *) fail "unexpected export: $s" ;; esac
+    case "$s" in
+    snd_pcm_*) ;;
+    snd_rawmidi_open | snd_rawmidi_close | snd_rawmidi_read | snd_rawmidi_tread) ;;
+    drmModePageFlip | drmModeSetCrtc) ;;
+    *) fail "unexpected export: $s" ;;
+    esac
+done
+# Never these: SampQOL defines them (LEDs, its own screens) and must stay
+# the only one.
+for s in snd_rawmidi_write drmModeAddFB drmIoctl; do
+    echo "$exports" | grep -qx "$s" && fail "must not export $s"
 done
 needed=$(readelf -dW "$B/fm.so" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' | tr '\n' ' ')
 

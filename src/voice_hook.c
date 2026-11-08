@@ -36,6 +36,7 @@
 #include "voice_hook.h"
 
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -88,10 +89,27 @@ static const layout_t LAYOUTS[] = {
 static const layout_t *g_layout;
 static uintptr_t g_base;
 
-/* ---- note starts, for the logs ---- */
+/* ---- note starts: for the logs and the FM page ----
+ * Written by the audio thread(s), read by others. Each cell has a sequence
+ * number: odd while it is written, 2 * index + 2 when done, so a reader
+ * never takes a half-written note (the patch in it must be whole). */
 #define NOTES 64
-static vh_note_t g_notes[NOTES];
-static uint64_t g_notes_head;
+typedef struct {
+    _Atomic uint64_t seq;
+    vh_note_t n;
+} note_cell;
+static note_cell g_notes[NOTES];
+static _Atomic uint64_t g_notes_head;
+
+static void note_put(const vh_note_t *n)
+{
+    uint64_t h = atomic_fetch_add_explicit(&g_notes_head, 1, memory_order_relaxed);
+    note_cell *c = &g_notes[h % NOTES];
+    atomic_store_explicit(&c->seq, 2 * h + 1, memory_order_relaxed);
+    atomic_thread_fence(memory_order_release);
+    memcpy(&c->n, n, sizeof *n);
+    atomic_store_explicit(&c->seq, 2 * h + 2, memory_order_release);
+}
 
 const char *vh_kind_name(int kind)
 {
@@ -105,13 +123,50 @@ const char *vh_kind_name(int kind)
 
 int vh_notes_since(uint64_t *cursor, vh_note_t *out, int max)
 {
-    uint64_t head = __atomic_load_n(&g_notes_head, __ATOMIC_ACQUIRE);
+    uint64_t head = atomic_load_explicit(&g_notes_head, memory_order_acquire);
     if (head - *cursor > NOTES)
         *cursor = head - NOTES;
     int n = 0;
-    while (*cursor < head && n < max)
-        out[n++] = g_notes[(*cursor)++ % NOTES];
+    while (*cursor < head && n < max) {
+        uint64_t i = *cursor, want = 2 * i + 2;
+        note_cell *c = &g_notes[i % NOTES];
+        uint64_t s1 = atomic_load_explicit(&c->seq, memory_order_acquire);
+        if (s1 < want)
+            break; /* still being written: next time */
+        if (s1 == want) {
+            memcpy(&out[n], &c->n, sizeof out[n]);
+            atomic_thread_fence(memory_order_acquire);
+            if (atomic_load_explicit(&c->seq, memory_order_relaxed) == want)
+                n++;
+        }
+        (*cursor)++; /* taken, or already overwritten by a newer note */
+    }
     return n;
+}
+
+/* ---- live edits ---- */
+static _Atomic uintptr_t g_edit_sample;
+static fm_patch g_edit_patch;
+
+void vh_edit_begin(uintptr_t sample, const fm_patch *p)
+{
+    atomic_store_explicit(&g_edit_sample, 0, memory_order_release);
+    fm_patch q = *p;
+    fm_patch_sanitize(&q);
+    memcpy(&g_edit_patch, &q, sizeof q);
+    atomic_store_explicit(&g_edit_sample, sample, memory_order_release);
+}
+
+void vh_edit_end(void) { atomic_store_explicit(&g_edit_sample, 0, memory_order_release); }
+uintptr_t vh_edit_sample(void) { return atomic_load_explicit(&g_edit_sample, memory_order_acquire); }
+fm_patch *vh_edit_patch(void) { return &g_edit_patch; }
+
+/* The patch this voice plays now: the edit patch while its Sample is
+ * being edited. */
+static inline const fm_patch *edit_or(uintptr_t sample, const fm_patch *own)
+{
+    uintptr_t e = atomic_load_explicit(&g_edit_sample, memory_order_acquire);
+    return e && e == sample ? &g_edit_patch : own;
 }
 
 static int in3(uintptr_t v, const uintptr_t t[3])
@@ -154,6 +209,7 @@ static int provider_kind(void *gen, uintptr_t *sample, uint32_t *vt_off)
 
 typedef struct {
     _Atomic(void *) owner; /* the DefaultSampleGenerator */
+    uintptr_t sample;      /* its Sample object at the note start */
     fm_voice voice;
     fm_patch patch;
     float root_hz;
@@ -185,12 +241,14 @@ typedef struct {
 } disk_entry;
 static disk_entry g_disk[DISK_ENTRIES];
 static int g_ndisk;
+static pthread_mutex_t g_disk_lock = PTHREAD_MUTEX_INITIALIZER; /* writers: logger, FM page */
 
 int vh_disk_count(void) { return __atomic_load_n(&g_ndisk, __ATOMIC_RELAXED); }
 
 int vh_disk_add(uintptr_t sample, uintptr_t provider, int name_i, uintptr_t name_obj, int name_k,
                 uintptr_t name_ptr, const void *patch, int root)
 {
+    pthread_mutex_lock(&g_disk_lock);
     /* the same object again (another file now): replace its entry */
     disk_entry *e = NULL;
     for (int i = 0; i < DISK_ENTRIES && !e; i++)
@@ -214,6 +272,7 @@ int vh_disk_add(uintptr_t sample, uintptr_t provider, int name_i, uintptr_t name
     for (int i = 0; i < DISK_ENTRIES; i++)
         n += atomic_load_explicit(&g_disk[i].sample, memory_order_relaxed) != 0;
     __atomic_store_n(&g_ndisk, n, __ATOMIC_RELAXED);
+    pthread_mutex_unlock(&g_disk_lock);
     return 1;
 }
 
@@ -306,10 +365,16 @@ static void claim(void *gen)
     memset(note.nib, 0xff, 8);
     if (!found && note.kind == VH_KIND_MEMORY) /* in RAM: the built-in path to the frames */
         found = disc_lookup(gen, &patch, &root, 0, note.nib);
+    if (found && note.sample && note.sample == vh_edit_sample()) /* being edited: the newest values */
+        memcpy(&patch, &g_edit_patch, sizeof patch);
+    note.provider = prov;
+    note.t_ns = t0;
     note.fm = found;
     note.algorithm = found ? patch.algorithm + 1 : 0;
-    uint64_t slot = __atomic_fetch_add(&g_notes_head, 1, __ATOMIC_ACQ_REL);
-    g_notes[slot % NOTES] = note; /* diagnostics: a torn entry is harmless */
+    note.root = root;
+    if (found)
+        note.patch = patch;
+    note_put(&note);
     uint64_t dt = now_ns() - t0;
     if (dt > atomic_load_explicit(&vh_stats.lookup_max_ns, memory_order_relaxed))
         atomic_store_explicit(&vh_stats.lookup_max_ns, dt, memory_order_relaxed);
@@ -319,6 +384,7 @@ static void claim(void *gen)
         void *expect = NULL;
         if (atomic_compare_exchange_strong(&g_slots[i].owner, &expect, gen)) {
             slot_t *s = &g_slots[i];
+            s->sample = note.sample;
             s->patch = patch;
             s->root_hz = 440.0f * powf(2.0f, (float)(root - 69) / 12.0f);
             s->ratio = 1.0;
@@ -457,7 +523,7 @@ void vh_post_render(vh_regs *r, uint64_t ret, vh_ctx *c)
         memcpy(&tb, &target, 4);
         for (int done = 0; done < m && !bad;) {
             int len = m - done < CHUNK ? m - done : CHUNK;
-            fm_voice_render(&s->voice, &s->patch, hz, y, len);
+            fm_voice_render(&s->voice, edit_or(s->sample, &s->patch), hz, y, len);
             for (int k = 0; k < len; k++)
                 if (!(fabsf(y[k]) < MAX_ABS)) /* NaN fails this too */
                     bad = 1;
@@ -619,7 +685,9 @@ void vh_test_setup(vh_fn start, vh_fn stop, vh_fn render, uintptr_t plain_mono)
     memset(g_slots, 0, sizeof g_slots);
     memset(&vh_stats, 0, sizeof vh_stats);
     vh_active = 0;
+    vh_edit_end();
 }
+void vh_test_note(const vh_note_t *n) { note_put(n); }
 uintptr_t vh_test_start(void *gen) { return e_start(gen, 0, 0, 0, 0, 0, 0, 0); }
 uintptr_t vh_test_stop(void *gen) { return e_stop(gen, 0, 0, 0, 0, 0, 0, 0); }
 uintptr_t vh_test_render(void *gen, float *buf, int n)

@@ -33,9 +33,23 @@ int carrier_from_file(const char *path, fm_patch *p, int *root);
 int library_scan(const char *const *dirs, int ndirs);
 int library_count(void);
 /* The patch for a sample file name ("FM-Bass-C3002.wav" finds
- * "FM-Bass-C3.wav": the MPC adds 3 digits to copies). 1 if found; found:
- * the library file's path. */
+ * "FM-Bass-C3.wav": the MPC adds 3 digits to copies). An edited patch
+ * (FM page) comes before the file. 0: not found; 1: from the file; 2: the
+ * edited one. found: the path it came from. */
 int library_find(const char *name, fm_patch *p, int *root, char *found, size_t cap);
+
+/* ---- patches edited on the FM page: <dir>/<name>.txt (patchfile.h) ----
+ * Scanned with the library. Thread-safe (the logger and the FM page). */
+void library_set_edit_dir(const char *dir);
+int library_edit_count(void);
+/* Changes at each save: samples seen before may need the new patch. */
+unsigned library_edit_generation(void);
+/* The name a sample's edits are saved under: the library's name for it
+ * (copy digits removed) if it has one, else the file name without .wav. */
+void library_canonical(const char *name, char *out, size_t cap);
+/* Write the file and use it from now on. 1: saved (msg: the path); 0: msg
+ * says why not. */
+int library_save_edit(const char *name, const fm_patch *p, int root, char *msg, size_t cap);
 
 /* The first frames of a WAV file as floats (first channel), and its format.
  * Returns the number of frames read (0: not a WAV we can read). */
