@@ -64,6 +64,34 @@ check "strip after a quick restart: amber 'FM off: crash guard' ($off_amber px)"
 check "strip off: no green left" test "$(band_lit 210 230 003ccf6e)" -eq 0
 [ -n "${STRIP_OUT:-}" ] && cp "$T/strip-on.raw" "$STRIP_OUT-on.raw" && cp "$FB" "$STRIP_OUT-off.raw"
 
+check "launch.log: line drawn" grep -q "status line drawn: FM on" "$T/boot5/launch.log"
+
+# Boot status watcher: draws only while no app runs, quits when it starts.
+head -c 307200 /dev/zero > "$FB"
+cp "$(command -v sleep)" "$T/fakeapp"
+mkdir -p "$T/w"
+watch_run() {
+    env MPCFM_STATE="$T/w" MPCFM_TEST_FB="$FB" MPCFM_TEST_APP_EXE="$T/fakeapp" \
+        MPCFM_TEST_SPLASH_MS=5000 "$T/shim/setarch" --mpcfm-splash "$@"
+}
+"$T/fakeapp" 30 &
+APP=$!
+watch_run on on &
+WP=$!
+sleep 0.7
+check "watcher: nothing drawn while the stock app runs" test "$(band_lit 210 230 003ccf6e)" -eq 0
+kill "$APP"; wait "$APP" 2>/dev/null || true
+sleep 1
+check "watcher: line drawn after the app stopped" test "$(band_lit 210 230 003ccf6e)" -gt 50
+"$T/fakeapp" 30 &
+APP=$!
+sleep 0.8
+if kill -0 "$WP" 2>/dev/null; then GONE=no; else GONE=yes; fi
+expect "watcher: quits when the new app starts" "$GONE" "yes"
+kill "$APP"; wait "$APP" 2>/dev/null || true
+wait "$WP" 2>/dev/null || true
+check "watcher: logged" grep -q "boot status line shown during the splash" "$T/w/launch.log"
+
 S="$T/boot6"
 rm "$T/fm.so"
 expect "fm.so missing: unchanged" "$(run "$S" 100 "$Q")" "PRELOAD=[$Q] $ARGS"

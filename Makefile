@@ -7,6 +7,7 @@
 #   make bench       FM engine benchmark on this computer (the device one is
 #                    build/aarch64/fmbench: copy it to the MPC and run it there)
 #   make wavs        render every preset to build/wav/ to listen to them
+#   make samples     FM sounds as WAV one-shots for pads: dist/MPC-FM-Samples/
 #
 # Cross build: zig cc. It links fm.so against glibc $(GLIBC) symbol
 # versions, so it runs on the device's glibc (>= 2.30, as SampQOL needs).
@@ -39,7 +40,7 @@ SHIM_FLAGS = -Isrc -Ilauncher
 ARM = build/aarch64
 HOST = build/host
 
-.PHONY: all toolchain arm check host dist bench wavs clean
+.PHONY: all toolchain arm check host dist bench wavs samples clean
 all: check arm
 
 toolchain: $(ZIG)
@@ -109,5 +110,12 @@ wavs: $(HOST)/fmrender
 	@mkdir -p build/wav
 	$(HOST)/fmrender all build/wav
 
+# FM sounds as WAV one-shots for MPC pads (copy the folder to the SD card).
+samples: $(HOST)/fmrender
+	@mkdir -p dist/MPC-FM-Samples
+	$(HOST)/fmrender samples dist/MPC-FM-Samples
+
+# Keeps dist/autorun/logs and anything you put in dist/ by hand.
 clean:
-	rm -rf build dist
+	rm -rf build dist/autorun/mpcfm dist/autorun/autorun.sh dist/autorun/autorun.json \
+		dist/autorun/autorun.check

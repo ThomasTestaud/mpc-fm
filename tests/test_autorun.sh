@@ -6,6 +6,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 B="$(cd "$1" && pwd)"
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
+export MPCFM_TEST_SPLASH_MS=300 # the background status watcher ends fast here
 sh "$ROOT/tools/mkdist.sh" "$B" "$T/sd" >/dev/null
 A="$T/sd/autorun"
 
@@ -54,10 +55,18 @@ mv "$A/autorun" "$A/SampQOL-OS-v0.1.5/autorun"
 out=$(env -u MPCFM_SO MPCFM_RUN="$T/run7" sh "$A/autorun.sh")
 expect "SampQOL inside its unzipped release folder" "$out" "qol dir=[$A/SampQOL-OS-v0.1.5/autorun] so=[$T/run7/fm.so] off=[] path1=[$T/run7/bin]"
 rm -rf "$A/SampQOL-OS-v0.1.5"
+fake_qol "$T/sd/sampqol-autorun"
+out=$(env -u MPCFM_SO MPCFM_RUN="$T/run8" sh "$A/autorun.sh")
+expect "SampQOL next to ours at the card root" "$out" "qol dir=[$T/sd/sampqol-autorun] so=[$T/run8/fm.so] off=[] path1=[$T/run8/bin]"
+fake_qol "$A/sampqol"
+out=$(env -u MPCFM_SO MPCFM_RUN="$T/run9" sh "$A/autorun.sh")
+expect "inside ours wins over the card root" "$out" "qol dir=[$A/sampqol] so=[$T/run9/fm.so] off=[] path1=[$T/run9/bin]"
+rm -rf "$T/sd/sampqol-autorun" "$A/sampqol"
 mkdir -p "$A/sampqol"
 : > "$A/sampqol/autorun.sh"
 
 out=$(env -u MPCFM_SO MPCFM_RUN="$T/run4" sh "$A/autorun.sh")
 expect "incomplete SampQOL folder: nothing starts" "$out" ""
-check "launch log explains" grep -q "no SampQOL OS folder in" "$A/logs/mpcfm-launch.log"
+check "launch log explains" grep -q "no SampQOL OS folder found in" "$A/logs/mpcfm-launch.log"
+sleep 1 # let the background watchers finish before the folder goes
 finish

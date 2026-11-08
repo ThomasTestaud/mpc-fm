@@ -28,7 +28,7 @@ runner checks `autorun.check`). Our launcher is that entry point:
 
 ```
 autorun/autorun.sh (ours)
-  -> autorun/<any>/autorun.sh        official SampQOL folder, unchanged (its own checks)
+  -> <SampQOL folder>/autorun.sh     official, unchanged: inside ours or at the card root
     -> qol-run.sh                    SampQOL watchdog + project safety net
       -> setarch                     OUR static stand-in, first in PATH:
                                      LD_PRELOAD += /run/mpcfm/fm.so,

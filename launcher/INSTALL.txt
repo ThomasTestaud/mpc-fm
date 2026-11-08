@@ -12,21 +12,30 @@ Install
 -------
 1. MPC Sample firmware 1.3.0 (1.3.0.12), as SampQOL OS needs.
 2. Copy the folder "autorun" of mpc-fm to the root of the SD card.
-3. Download SampQOL OS and unzip it. Copy ITS folder "autorun" INTO our
-   "autorun" folder. Do not change any file in it. The name does not
-   matter: "autorun", "sampqol", or the whole unzipped release folder.
+3. Download SampQOL OS and unzip it. Copy ITS folder "autorun" to the
+   card, unchanged, under another name: next to ours at the root (for
+   example "sampqol-autorun"), or inside our "autorun" folder (any name).
 
    SD card
    +-- autorun/              mpc-fm (starts first)
-       +-- autorun.json, autorun.check, autorun.sh
-       +-- mpcfm/            fm.so, setarch, INSTALL.txt
-       +-- autorun/          the official SampQOL "autorun" folder, unchanged
-       +-- logs/             made at start-up
+   |   +-- autorun.json, autorun.check, autorun.sh
+   |   +-- mpcfm/            fm.so, setarch, INSTALL.txt
+   |   +-- logs/             made at start-up
+   +-- sampqol-autorun/      the official SampQOL "autorun" folder, unchanged
 
 4. Put the card in the MPC and switch it on. SampQOL OS starts as usual.
    Under the SampQOL logo, a line shows "mpc-fm 0.0.1  FM on", or
    "FM off: <reason>" (disabled, files changed, crash guard, ...).
-   No line at all: SampQOL was not found, see logs/mpcfm-launch.log.
+   No SampQOL splash at all: SampQOL was not found, the MPC starts stock.
+   See logs/mpcfm-launch.log.
+
+FM sounds on pads today
+-----------------------
+The live FM engine is not in the app yet. The folder MPC-FM-Samples has
+FM sounds made by the same engine, as WAV one-shots at C3. Copy it to the
+card, load a file on a pad in SAMPLE SELECT, and play it chromatically in
+Keys mode. (They are recordings: pitch changes their length, as for any
+sample.)
 
 Results
 -------

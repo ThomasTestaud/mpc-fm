@@ -9,7 +9,8 @@ VERSION=$(sed -n 's/^#define MPCFM_VERSION "\(.*\)"$/\1/p' "$ROOT/src/version.h"
 [ -n "$VERSION" ] || { echo "mkdist: no version in src/version.h" >&2; exit 1; }
 
 A="$OUT/autorun"
-rm -rf "$A"
+# Replace only our own files: keep logs/ and anything else put there.
+rm -rf "$A/mpcfm" "$A/autorun.sh" "$A/autorun.json" "$A/autorun.check"
 mkdir -p "$A/mpcfm"
 cp "$BIN/fm.so" "$BIN/setarch" "$A/mpcfm/"
 

@@ -2,6 +2,7 @@
  *
  *   fmrender PRESET MIDI_NOTE VELOCITY HOLD_S TOTAL_S OUT.wav
  *   fmrender all DIR          (each preset: C2, C3 and C4, into DIR)
+ *   fmrender samples DIR      (each preset once, at C3, for MPC pads)
  *   fmrender list
  */
 #include <math.h>
@@ -36,6 +37,9 @@ static float render_wav(const fm_patch *p, float hz, float vel, int hold, int to
         fm_voice_render(&v, p, hz, x + done, n);
         done += n;
     }
+    int fade = SR / 100; /* 10 ms fade-out: no click if the sound is still on */
+    for (int i = 0; i < fade && i < total; i++)
+        x[total - 1 - i] *= (float)i / (float)fade;
     float pk = 0;
     for (int i = 0; i < total; i++)
         pk = fabsf(x[i]) > pk ? fabsf(x[i]) : pk;
@@ -93,6 +97,23 @@ int main(int argc, char **argv)
                 float pk = render_wav(&p, midi_hz(note), 0.8f, SR, 3 * SR, path);
                 printf("%s  peak %.2f\n", path, pk);
             }
+        }
+        return 0;
+    }
+    if (argc == 3 && strcmp(argv[1], "samples") == 0) {
+        /* name, hold s, total s: one-shots for pads (Keys mode transposes) */
+        static const struct { const char *preset, *file; float hold, total; } S[] = {
+            {"E.Piano", "FM-EPiano-C3", 2.0f, 4.0f}, {"Bass", "FM-Bass-C3", 0.6f, 1.2f},
+            {"Bell", "FM-Bell-C3", 0.5f, 6.0f},      {"Brass", "FM-Brass-C3", 1.5f, 2.5f},
+            {"Metal Hit", "FM-MetalHit-C3", 0.1f, 0.8f}, {"Sine", "FM-Sine-C3", 2.0f, 2.5f},
+        };
+        for (size_t i = 0; i < sizeof S / sizeof *S; i++) {
+            fm_patch p;
+            fm_preset_get(fm_preset_find(S[i].preset), &p);
+            char path[512];
+            snprintf(path, sizeof path, "%s/%s.wav", argv[2], S[i].file);
+            float pk = render_wav(&p, midi_hz(60), 0.9f, (int)(S[i].hold * SR), (int)(S[i].total * SR), path);
+            printf("%s  peak %.2f\n", path, pk);
         }
         return 0;
     }

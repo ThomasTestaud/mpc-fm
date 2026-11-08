@@ -46,7 +46,7 @@ int strip_draw(const char *fb_path, const char *text, const char *status, unsign
 {
     int fd = open(fb_path, O_RDWR | O_CLOEXEC | O_NONBLOCK);
     if (fd < 0)
-        return -1;
+        return STRIP_ERR_OPEN;
 
     int width, height;
     size_t stride;
@@ -55,7 +55,7 @@ int strip_draw(const char *fb_path, const char *text, const char *status, unsign
     if (ioctl(fd, FBIOGET_VSCREENINFO, &var) == 0 && ioctl(fd, FBIOGET_FSCREENINFO, &fix) == 0) {
         if (var.bits_per_pixel != 32 || var.xres == 0 || fix.line_length < var.xres * 4) {
             close(fd);
-            return -1; /* not the XRGB8888 screen we know */
+            return STRIP_ERR_FORMAT; /* not the XRGB8888 screen we know */
         }
         width = (int)var.xres;
         height = (int)var.yres;
@@ -67,13 +67,13 @@ int strip_draw(const char *fb_path, const char *text, const char *status, unsign
         stride = 1280;
 #else
         close(fd);
-        return -1;
+        return STRIP_ERR_IOCTL;
 #endif
     }
     int top = height - BAND_FROM_BOTTOM;
     if (top < 0) {
         close(fd);
-        return -1;
+        return STRIP_ERR_FORMAT;
     }
 
     size_t len = stride * BAND_H;
@@ -81,7 +81,7 @@ int strip_draw(const char *fb_path, const char *text, const char *status, unsign
     unsigned char *band = malloc(len);
     if (!band) {
         close(fd);
-        return -1;
+        return STRIP_ERR_WRITE;
     }
     if (pread(fd, band, len, off) != (ssize_t)len)
         memset(band, 0, len);
@@ -107,5 +107,5 @@ int strip_draw(const char *fb_path, const char *text, const char *status, unsign
     ssize_t w = pwrite(fd, band, len, off);
     free(band);
     close(fd);
-    return w == (ssize_t)len ? 0 : -1;
+    return w == (ssize_t)len ? 0 : STRIP_ERR_WRITE;
 }

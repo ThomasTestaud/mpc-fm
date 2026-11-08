@@ -7,3 +7,4 @@ dist/
 # Never commit SampQOL files (closed source, no redistribution).
 mpcqol.so
 qol-*.sh
+device-logs/

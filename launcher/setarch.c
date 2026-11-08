@@ -21,6 +21,7 @@
  * Built static (musl), so LD_PRELOAD has no effect on this program.
  */
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
@@ -215,26 +216,131 @@ static const char *decide(const char *so, const char *preload, const char **labe
     return NULL;
 }
 
-static void show(const char *label, int on)
+static const char *fb_path(void)
 {
-    const char *fb = "/dev/fb0";
 #ifdef MPCFM_TEST
-    const char *t = getenv("MPCFM_TEST_FB");
-    if (!t)
-        return;
-    fb = t;
+    return getenv("MPCFM_TEST_FB"); /* NULL: tests that do not look at the screen */
+#else
+    return "/dev/fb0";
 #endif
+}
+
+/* Draw the status line. Returns strip_draw()'s result. */
+static int draw(const char *label, int on)
+{
+    const char *fb = fb_path();
+    if (!fb)
+        return STRIP_ERR_OPEN;
     char status[96];
     snprintf(status, sizeof status, on ? "FM %s" : "FM off: %s", label);
-    if (strip_draw(fb, "mpc-fm " MPCFM_VERSION "  ", status, on ? STRIP_RGB_ON : STRIP_RGB_OFF) != 0)
-        logline("status strip not drawn (%s)", fb);
+    return strip_draw(fb, "mpc-fm " MPCFM_VERSION "  ", status, on ? STRIP_RGB_ON : STRIP_RGB_OFF);
+}
+
+static const char *strip_error(int r)
+{
+    switch (r) {
+    case STRIP_ERR_OPEN: return "cannot open the framebuffer";
+    case STRIP_ERR_IOCTL: return "no screen info";
+    case STRIP_ERR_FORMAT: return "unknown screen format";
+    default: return "write failed";
+    }
+}
+
+static void show(const char *label, int on)
+{
+    int r = draw(label, on);
+    if (r == 0)
+        logline("status line drawn: FM %s%s", on ? "" : "off: ", label);
+    else if (fb_path())
+        logline("status line not drawn: %s", strip_error(r));
+}
+
+/* ---- boot status watcher: setarch --mpcfm-splash on|off LABEL ----
+ *
+ * Started in the background by our autorun.sh, before SampQOL starts. The
+ * line drawn at exec time alone can be too short to see: SampQOL shows its
+ * splash right after it stops the stock app, then waits about a second and
+ * prepares its project safety net before it starts the app. So this
+ * watcher waits until the stock app has stopped, then redraws the line
+ * every 0.3 s while no app runs (only then is the framebuffer on the
+ * screen), and quits when the new app starts or after 60 s. */
+
+static const char *app_exe(void)
+{
+#ifdef MPCFM_TEST
+    const char *t = getenv("MPCFM_TEST_APP_EXE");
+    if (t)
+        return t;
+#endif
+    return "/usr/bin/MPC Sample";
+}
+
+static int app_running(const char *exe)
+{
+    DIR *d = opendir("/proc");
+    if (!d)
+        return 0;
+    int found = 0;
+    struct dirent *e;
+    while (!found && (e = readdir(d))) {
+        if (e->d_name[0] < '1' || e->d_name[0] > '9')
+            continue;
+        char p[300], t[512];
+        snprintf(p, sizeof p, "/proc/%s/exe", e->d_name);
+        ssize_t n = readlink(p, t, sizeof t - 1);
+        if (n > 0) {
+            t[n] = 0;
+            found = strcmp(t, exe) == 0;
+        }
+    }
+    closedir(d);
+    return found;
+}
+
+static void nap_ms(long ms)
+{
+    struct timespec t = {ms / 1000, (ms % 1000) * 1000000L};
+    nanosleep(&t, NULL);
+}
+
+static int splash_watch(int on, const char *label)
+{
+    const char *exe = app_exe();
+    long limit = 60000, t = 0;
+#ifdef MPCFM_TEST
+    const char *l = getenv("MPCFM_TEST_SPLASH_MS");
+    if (l)
+        limit = atol(l);
+#endif
+    while (app_running(exe)) { /* the stock app still owns the screen */
+        if (t >= limit)
+            return 0;
+        nap_ms(100);
+        t += 100;
+    }
+    nap_ms(300); /* SampQOL draws its splash right after it stops the app */
+    t += 300;
+    int drawn = 0, last = 0;
+    while (t < limit && !app_running(exe)) {
+        last = draw(label, on);
+        drawn += last == 0;
+        nap_ms(300);
+        t += 300;
+    }
+    if (drawn)
+        logline("boot status line shown during the splash (%d redraws)", drawn);
+    else
+        logline("boot status line not shown during the splash: %s",
+                t >= limit ? "timeout" : strip_error(last));
+    return 0;
 }
 
 int main(int argc, char **argv)
 {
-    (void)argc;
     g_state = getenv("MPCFM_STATE");
     g_logdir = getenv("MPCFM_LOGDIR");
+    if (argc == 4 && strcmp(argv[1], "--mpcfm-splash") == 0)
+        return splash_watch(strcmp(argv[2], "on") == 0, argv[3]);
     const char *so = getenv("MPCFM_SO");
     const char *preload = getenv("LD_PRELOAD");
 
